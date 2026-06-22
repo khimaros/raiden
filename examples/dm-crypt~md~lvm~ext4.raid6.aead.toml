@@ -1,0 +1,39 @@
+# example: dm-crypt~md~lvm~ext4 (recommended).
+#
+# per-disk dm-crypt with aead integrity, an md raid6 array over the crypt
+# devices, lvm on top, and an ext4 root. adjust [disks].members to your system.
+
+[install]
+release = "forky"
+backports = false
+boot_mode = "efi"
+extra_packages = ["vim", "git", "rsync", "screen"]
+serial_console = false
+
+[disks]
+members = ["vda", "vdb", "vdc", "vdd"]
+part_prefix = ""
+
+[raid]
+stack = "dm-crypt~md~lvm~ext4"
+level = "6"
+metadata_level = ""
+
+[crypt]
+# aegis128 is an aead cipher, so it requires crypt integrity = "aead".
+cipher = "aegis128-plain64"
+key_size = 128
+sector_size = 4096
+integrity = "aead"
+extra_args = []
+
+[integrity]
+algorithm = "xxhash64"
+
+[btrfs]
+csum = "xxhash"
+
+[boot]
+raid = false
+level = 1
+bitmap = "internal"

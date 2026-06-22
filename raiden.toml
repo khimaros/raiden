@@ -1,0 +1,70 @@
+# raiden install-time configuration (the recommended dm-crypt~md~lvm~ext4 stack).
+# see examples/ for a complete, ready-to-edit config per stack.
+#
+# precedence, lowest to highest: built-in defaults, this file, environment,
+# command line flags. the encryption password is never stored here; raiden
+# prompts for it.
+
+[install]
+# debian release to bootstrap
+release = "forky"
+# enable debian backports
+backports = false
+# "efi" or "bios"
+boot_mode = "efi"
+# utility packages unrelated to raid
+extra_packages = ["vim", "git", "rsync", "screen"]
+# enable a serial console (ttyS0) on the installed system. useful for headless
+# servers and required by the automated vm test harness.
+serial_console = false
+
+[disks]
+# explicit list of member disks (no glob/eval). a stable id under /dev is fine.
+members = ["vda", "vdb", "vdc", "vdd"]
+# partition name prefix; usually "p" for nvme, empty otherwise
+part_prefix = ""
+
+[raid]
+# stack identifier, one of:
+#   dm-crypt~md~lvm~ext4   (recommended)
+#   dm-crypt~btrfs
+#   dm-crypt~zfs
+#   dm-integrity~md~dm-crypt~lvm~ext4
+stack = "dm-crypt~md~lvm~ext4"
+# raid level for the data array:
+#   md: 0, 1, 5, 6, 10
+#   zfs: raidz1, raidz2, raidz3
+#   btrfs: raid0, raid1, raid1c2, raid1c3, raid1c4, raid5, raid6, raid10
+level = "6"
+# metadata level (btrfs only); empty defaults to level
+metadata_level = ""
+
+[crypt]
+cipher = "aegis128-plain64"
+key_size = 128
+sector_size = 4096
+# "aead" enables integrity in the dm-crypt layer; "none" disables it.
+# typically "none" for btrfs/zfs (which checksum themselves) and for the
+# dm-integrity stack (which integrity-checks below md).
+integrity = "aead"
+# escape hatch for raw cryptsetup flags not modeled above
+extra_args = []
+
+# dm-integrity stack only: integrity algorithm below md
+[integrity]
+algorithm = "xxhash64"
+
+# btrfs stacks only: data/metadata checksum algorithm
+#   crc32c (default), xxhash, sha256, blake2
+[btrfs]
+csum = "xxhash"
+
+[boot]
+# put /boot on an md raid1 array across all disks (raid = true), or give each
+# disk an independent ext4 /boot kept in sync by a hook (false, the default).
+# false avoids the fragile boot-array assembly when the first disk is lost.
+raid = false
+# md raid1 level + write-intent bitmap, used only when raid = true (bitmap is
+# also reused by the data array).
+level = 1
+bitmap = "internal"

@@ -1,0 +1,21 @@
+[package]
+name = "raiden"
+version = "0.1.0"
+edition = "2021"
+description = "provision and maintain full-disk-encrypted RAID systems on Debian"
+license = "MIT"
+
+[[bin]]
+name = "raiden"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+regex = "1.11"
+
+[profile.release]
+strip = true
+lto = true

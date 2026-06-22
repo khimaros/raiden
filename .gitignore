@@ -1,0 +1,6 @@
+/target
+**/__pycache__/
+.venv/
+.pytest_cache/
+tests/**/report.md
+tests/vm/reports/

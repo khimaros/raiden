@@ -1,0 +1,43 @@
+# build the static binary and attach it to a github release whenever a vX.Y.Z
+# tag is pushed (directly, or by publishing a release from the github ui, which
+# pushes the tag). the asset name matches what install.sh downloads. tagging is
+# the maintainer's action; this workflow only packages and uploads.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create/update the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # the pinned toolchain (rust + the musl target prereq) comes from mise.toml,
+      # so CI builds with the same rust the repo develops against.
+      - uses: jdx/mise-action@v2
+      - run: rustup target add x86_64-unknown-linux-musl
+
+      # do not ship a binary that fails its own tests.
+      - run: cargo test --locked
+
+      - run: make dist
+
+      # stage the artifact under the name install.sh expects, with a checksum.
+      - name: stage release artifact
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/raiden dist/raiden-x86_64-linux-musl
+          ( cd dist && sha256sum raiden-x86_64-linux-musl > raiden-x86_64-linux-musl.sha256 )
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/raiden-x86_64-linux-musl
+            dist/raiden-x86_64-linux-musl.sha256
+          fail_on_unmatched_files: true

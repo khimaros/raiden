@@ -1,0 +1,44 @@
+# example: dm-crypt~bcachefs.
+#
+# per-disk dm-crypt with a multi-device bcachefs filesystem on top. bcachefs
+# checksums and replicates its own data, so the crypt layer uses a plain cipher
+# (no aead). redundancy is by replica count: raid.level = 3 keeps 3 copies, so the
+# array survives losing 2 of 4 members. adjust [disks].members to your system.
+#
+# note: bcachefs is out-of-tree -- the kernel module (dkms) and tools come from
+# apt.bcachefs.org, which raiden adds automatically. it is newer and less proven
+# than the md/zfs/btrfs stacks.
+
+[install]
+release = "forky"
+backports = false
+boot_mode = "efi"
+extra_packages = ["vim", "git", "rsync", "screen"]
+serial_console = false
+
+[disks]
+members = ["vda", "vdb", "vdc", "vdd"]
+part_prefix = ""
+
+[raid]
+stack = "dm-crypt~bcachefs"
+level = "3"
+metadata_level = ""
+
+[crypt]
+cipher = "aes-xts-plain64"
+key_size = 512
+sector_size = 4096
+integrity = "none"
+extra_args = []
+
+[integrity]
+algorithm = "crc32c"
+
+[btrfs]
+csum = "xxhash"
+
+[boot]
+raid = false
+level = 1
+bitmap = "internal"

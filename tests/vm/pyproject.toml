@@ -1,0 +1,9 @@
+[project]
+name = "raiden-vm-e2e"
+version = "0.0.0"
+description = "automated libvirt vm end-to-end harness for raiden"
+requires-python = ">=3.11"
+dependencies = ["pexpect>=4.9", "pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["raiden_e2e*"]

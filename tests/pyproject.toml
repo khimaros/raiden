@@ -1,0 +1,10 @@
+[project]
+name = "raiden-e2e"
+version = "0.0.0"
+description = "end-to-end tests for raiden"
+requires-python = ">=3.11"
+dependencies = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+# the libvirt vm harness lives under vm/ and is run separately (make test-vm).
+addopts = "--ignore=vm"

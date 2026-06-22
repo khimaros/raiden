@@ -1,0 +1,5 @@
+# deterministic toolchain for raiden. run `mise install` to provision.
+[tools]
+rust = "1.95"
+python = "3.13"
+uv = "latest"

@@ -1,0 +1,43 @@
+# example: dm-crypt~zfs.
+#
+# per-disk dm-crypt (no aead -- zfs checksums its own data) with a zfs raidz2
+# pool across the crypt devices. zfs-dkms builds against the running kernel, so
+# the install takes longer and pulls from contrib. adjust [disks].members.
+
+[install]
+release = "forky"
+backports = false
+boot_mode = "efi"
+extra_packages = ["vim", "git", "rsync", "screen"]
+serial_console = false
+
+[disks]
+members = ["vda", "vdb", "vdc", "vdd"]
+part_prefix = ""
+
+[raid]
+stack = "dm-crypt~zfs"
+level = "raidz2"
+metadata_level = ""
+
+[crypt]
+# zfs checksums its own data, so the crypt layer is plain (no aead). a plain
+# cipher (aes-xts) is required when integrity = "none". sector_size 4096 suits
+# 4k-native ssds; raiden aligns the root partition to it so plain luksFormat
+# (which requires a sector-multiple device size) accepts it.
+cipher = "aes-xts-plain64"
+key_size = 512
+sector_size = 4096
+integrity = "none"
+extra_args = []
+
+[integrity]
+algorithm = "xxhash64"
+
+[btrfs]
+csum = "xxhash"
+
+[boot]
+raid = false
+level = 1
+bitmap = "internal"

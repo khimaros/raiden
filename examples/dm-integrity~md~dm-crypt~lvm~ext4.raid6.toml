@@ -1,0 +1,44 @@
+# example: dm-integrity~md~dm-crypt~lvm~ext4.
+#
+# dm-integrity below md (detects bitrot), an md raid6 array, a single dm-crypt
+# over the whole array, then lvm and ext4. integrity lives below md here, so the
+# crypt layer is plain (no aead). adjust [disks].members to your system.
+
+[install]
+release = "forky"
+backports = false
+boot_mode = "efi"
+extra_packages = ["vim", "git", "rsync", "screen"]
+serial_console = false
+
+[disks]
+members = ["vda", "vdb", "vdc", "vdd"]
+part_prefix = ""
+
+[raid]
+stack = "dm-integrity~md~dm-crypt~lvm~ext4"
+level = "6"
+metadata_level = ""
+
+[crypt]
+# integrity is provided by dm-integrity below md, so the crypt layer is plain
+# (no aead). a plain cipher (aes-xts) is required when integrity = "none".
+cipher = "aes-xts-plain64"
+key_size = 512
+sector_size = 4096
+integrity = "none"
+extra_args = []
+
+[integrity]
+# integrity algorithm checked below md. crc32c is kernel built-in (no extra
+# crypto module); xxhash64 needs the xxhash module, absent from the live env and
+# the integrity initramfs hook, so its dm-integrity table load fails.
+algorithm = "crc32c"
+
+[btrfs]
+csum = "xxhash"
+
+[boot]
+raid = false
+level = 1
+bitmap = "internal"
