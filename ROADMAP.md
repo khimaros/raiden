@@ -285,6 +285,10 @@
     (created for the tag, or the one published from the UI). preserves any
     release notes the maintainer wrote; tagging stays the maintainer's action
 
+[x] bug: `raiden init` disk discovery presented members in lsblk's discovery order,
+    not sorted, so eg. nvme2n1 appeared before nvme1n1 in the suggested members
+    list. parse_disks now sorts discovered disks by name (lexical).
+
 [ ] expand test coverage (see ANALYSIS.md "coverage gaps"):
     - dm-integrity~md~dm-crypt~lvm~ext4 (the untested 4th stack; dm-integrity
       below md vs aead above it)

@@ -341,6 +341,13 @@ fn discover() -> Result<Vec<Disk>> {
     }
     let in_use = in_use_disks();
     let text = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_disks(&text, &in_use))
+}
+
+/// parse `lsblk -dn -b -o NAME,SIZE,RM,TYPE,MODEL` output into whole disks, sorted
+/// by name (lsblk lists in discovery order, eg. nvme2n1 before nvme1n1) so the
+/// suggested member order is stable and predictable.
+fn parse_disks(text: &str, in_use: &HashSet<String>) -> Vec<Disk> {
     let mut disks = Vec::new();
     for line in text.lines() {
         // columns: NAME SIZE RM TYPE [MODEL...]; MODEL may have spaces or be empty.
@@ -366,7 +373,8 @@ fn discover() -> Result<Vec<Disk>> {
             in_use: in_use.contains(name),
         });
     }
-    Ok(disks)
+    disks.sort_by(|a, b| a.name.cmp(&b.name));
+    disks
 }
 
 /// best-effort set of whole-disk names backing the live/root mountpoints, so the
@@ -461,6 +469,23 @@ mod tests {
         assert_eq!(zfs.cipher, "aes-xts-plain64");
         assert_eq!(zfs.integrity, "none");
         assert_eq!(zfs.key_size, 512);
+    }
+
+    #[test]
+    fn discovered_disks_are_sorted_by_name() {
+        // lsblk lists in discovery order, which can be out of order (nvme2n1 before
+        // nvme1n1); the suggested members must be presented sorted by name.
+        let text = "\
+nvme2n1 512110190592 0 disk Samsung SSD
+nvme0n1 512110190592 0 disk Samsung SSD
+nvme3n1 512110190592 0 disk Samsung SSD
+nvme1n1 512110190592 0 disk Samsung SSD
+";
+        let names: Vec<String> = parse_disks(text, &HashSet::new())
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(names, ["nvme0n1", "nvme1n1", "nvme2n1", "nvme3n1"]);
     }
 
     #[test]
