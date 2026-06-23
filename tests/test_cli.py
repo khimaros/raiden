@@ -451,6 +451,35 @@ def test_install_without_config_defaults_to_recommended_stack(raiden, tmp_path):
     assert "mkfs.ext4 -m 0 /dev/vg0/root" in out
 
 
+def test_crypt_integrity_no_wipe_adds_flag_for_aead(raiden, tmp_path):
+    # crypt.integrity_no_wipe passes --integrity-no-wipe to luksFormat on aead
+    # stacks, skipping the slow full-device integrity wipe. it is off by default.
+    assert "--integrity-no-wipe" not in raiden("install", "--dry-run").stdout
+    cfg = tmp_path / "nowipe.toml"
+    cfg.write_text(
+        '[disks]\nmembers = ["vda", "vdb", "vdc", "vdd"]\n'
+        '[raid]\nstack = "dm-crypt~md~lvm~ext4"\nlevel = "6"\n'
+        '[crypt]\nintegrity = "aead"\nintegrity_no_wipe = true\n'
+    )
+    out = raiden("install", "--dry-run", "--config", str(cfg)).stdout
+    assert "luksFormat" in out and "--integrity=aead" in out
+    assert "--integrity-no-wipe" in out
+
+
+def test_crypt_integrity_no_wipe_ignored_without_aead(raiden, tmp_path):
+    # the flag is only valid alongside --integrity; a plain (no-integrity) stack
+    # must never emit it, or cryptsetup would reject the format.
+    cfg = tmp_path / "plain.toml"
+    cfg.write_text(
+        '[disks]\nmembers = ["vda", "vdb", "vdc", "vdd"]\n'
+        '[raid]\nstack = "dm-crypt~zfs"\nlevel = "raidz2"\n'
+        '[crypt]\ncipher = "aes-xts-plain64"\nkey_size = 512\n'
+        'integrity = "none"\nintegrity_no_wipe = true\n'
+    )
+    out = raiden("install", "--dry-run", "--config", str(cfg)).stdout
+    assert "--integrity-no-wipe" not in out
+
+
 def test_bios_grub_install_is_noninteractive(raiden):
     # the bios bootloader path must not block on an interactive dpkg-reconfigure
     # grub-pc (it hangs an unattended install). it preseeds the install devices

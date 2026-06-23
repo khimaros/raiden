@@ -147,6 +147,12 @@ dm-integrity stacks use a plain cipher (aes-xts) because integrity is provided
 elsewhere (zfs/btrfs checksum their own data; dm-integrity sits below md). the
 examples encode this so a stack is configured correctly out of the box.
 
+on the aead stacks, luksFormat wipes the whole disk to initialize integrity tags,
+which is slow on large disks. `crypt.integrity_no_wipe = true` skips it for a fast
+format, at the cost of leaving tags uninitialized (reads of unwritten sectors fail
+until written, and it conflicts with the md array's initial resync) -- see the
+caveat in [raiden.toml](raiden.toml).
+
 by default `/boot` is not a raid array: each disk carries its own ext4 `/boot`
 (all sharing one fs uuid), so every disk's grub boots from its local copy and the
 system survives losing any disk -- including the first -- with no array to

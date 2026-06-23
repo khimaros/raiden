@@ -84,6 +84,9 @@ pub struct Crypt {
     pub key_size: u32,
     pub sector_size: u32,
     pub integrity: String,
+    // skip luksFormat's full-device integrity wipe (aead only). fast, but leaves
+    // integrity tags uninitialized until written.
+    pub integrity_no_wipe: bool,
     pub extra_args: Vec<String>,
 }
 
@@ -139,6 +142,7 @@ impl Default for Crypt {
             key_size: 128,
             sector_size: 4096,
             integrity: "aead".into(),
+            integrity_no_wipe: false,
             extra_args: Vec::new(),
         }
     }

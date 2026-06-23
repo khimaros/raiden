@@ -289,6 +289,11 @@
     not sorted, so eg. nvme2n1 appeared before nvme1n1 in the suggested members
     list. parse_disks now sorts discovered disks by name (lexical).
 
+[x] crypt.integrity_no_wipe (default false): pass --integrity-no-wipe to luksFormat
+    for aead stacks, skipping the slow full-device integrity wipe. off by default;
+    documented caveat that it leaves tags uninitialized (reads of unwritten sectors
+    fail) and conflicts with the md array's initial resync.
+
 [ ] expand test coverage (see ANALYSIS.md "coverage gaps"):
     - dm-integrity~md~dm-crypt~lvm~ext4 (the untested 4th stack; dm-integrity
       below md vs aead above it)

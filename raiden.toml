@@ -47,6 +47,12 @@ sector_size = 4096
 # typically "none" for btrfs/zfs (which checksum themselves) and for the
 # dm-integrity stack (which integrity-checks below md).
 integrity = "aead"
+# skip luksFormat's full-device integrity wipe (aead only). the wipe writes valid
+# tags across the whole disk and is slow on large disks. skipping it leaves tags
+# uninitialized, so reads of not-yet-written sectors FAIL until written -- which
+# conflicts with the md array's initial resync (it reads every sector). leave
+# false unless you understand the consequences for your stack.
+integrity_no_wipe = false
 # escape hatch for raw cryptsetup flags not modeled above
 extra_args = []
 

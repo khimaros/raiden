@@ -45,8 +45,9 @@ it is never okay to regress on a "must not regress" requirement in a release.
 - R10. prompt for the encryption password once, verify it, never write it to
   disk or logs.
 - R11. tunable layer options: dm-crypt cipher, key size, sector size, aead
-  integrity; dm-integrity algorithm; btrfs checksum algorithm; ext4
-  stride/stripe-width aligned to the real md geometry.
+  integrity (and optionally skipping its full-device wipe); dm-integrity
+  algorithm; btrfs checksum algorithm; ext4 stride/stripe-width aligned to the
+  real md geometry.
 - R12. post-install operations:
   - `status`: array health, plus mapping md read errors back to affected file
     paths (md stacks) via raid-stripe geometry, dmsetup offsets, and debugfs.

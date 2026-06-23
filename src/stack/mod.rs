@@ -254,6 +254,11 @@ fn cryptsetup_format_argv(cfg: &Config, dev: &str) -> Vec<String> {
     ];
     if c.integrity == "aead" {
         a.push("--integrity=aead".to_string());
+        // skip the full-device integrity wipe (slow on large disks); tags are then
+        // uninitialized until written. only valid alongside --integrity.
+        if c.integrity_no_wipe {
+            a.push("--integrity-no-wipe".to_string());
+        }
     }
     a.extend(c.extra_args.iter().cloned());
     a.push(dev.to_string());
