@@ -11,6 +11,7 @@ use crate::step::{Phase, Step};
 
 pub const APT: &str = "apt";
 pub const PREPARE: &str = "prepare";
+pub const RESET: &str = "reset";
 pub const PARTITION: &str = "partition";
 pub const FORMAT: &str = "format";
 pub const MOUNT: &str = "mount";
@@ -22,7 +23,7 @@ pub const FINISH: &str = "finish";
 pub const CLOSE: &str = "close";
 
 pub const PHASES: &[&str] = &[
-    APT, PREPARE, PARTITION, FORMAT, MOUNT, STRAP, BIND, INSTALL, BOOTLOADER, FINISH, CLOSE,
+    APT, PREPARE, RESET, PARTITION, FORMAT, MOUNT, STRAP, BIND, INSTALL, BOOTLOADER, FINISH, CLOSE,
 ];
 
 // vfat mount options for every esp, matching what grub-install would write.
@@ -41,6 +42,9 @@ pub fn install(
     vec![
         apt_phase(cfg, stack),
         prepare_phase(),
+        // free the member disks first, so a re-run of install does not fail at
+        // wipefs because a prior run's crypt/md/lvm still holds them.
+        reset_phase(cfg, layout, stack),
         partition_phase(cfg, layout, stack),
         format_phase(cfg, layout, stack),
         Phase::new(MOUNT, stack.mount_root(cfg, layout)),
@@ -686,7 +690,13 @@ fn esp_fstab_steps(layout: &Layout) -> Vec<Step> {
         .collect()
 }
 
-pub fn close_phase(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Phase {
+/// tear down any existing stack on the member disks: lazily unmount everything
+/// under /mnt, then the stack's own layer teardown (lvm/md/crypt, or the zpool),
+/// then the boot array. every step is best-effort, so this no-ops on a clean run
+/// and frees the disks on a re-run. shared by `reset_phase` (install, up front)
+/// and `close_phase` (the close op, at the end). it tears down only raiden's own
+/// deterministic device names; a foreign array assembled by hand is not touched.
+fn teardown_steps(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Vec<Step> {
     let mut s = vec![Step::sh(
         "unmount everything under /mnt",
         "mount | tac | awk '/\\/mnt/ {print $3}' | xargs -r -I{} umount -lf {}",
@@ -696,5 +706,20 @@ pub fn close_phase(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Phase {
     if layout.boot_raid() {
         s.push(stack::md_stop(BOOT_MD_DEVICE));
     }
-    Phase::new(CLOSE, s)
+    s
+}
+
+/// free the member disks before partitioning so a re-run of install does not fail
+/// at wipefs with "Device or resource busy" while a prior run's crypt/md/lvm still
+/// holds them. settles udev after the teardown: the just-closed dm devices are
+/// released asynchronously, and the next phase's wipefs would otherwise race that
+/// release (the same settle the replace op needs after its teardown).
+pub fn reset_phase(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Phase {
+    let mut s = teardown_steps(cfg, layout, stack);
+    s.push(Step::run("settle udev after teardown", &["udevadm", "settle"]).best_effort());
+    Phase::new(RESET, s)
+}
+
+pub fn close_phase(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Phase {
+    Phase::new(CLOSE, teardown_steps(cfg, layout, stack))
 }

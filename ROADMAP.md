@@ -303,6 +303,20 @@
     - bios boot (all runs used efi); more raid levels (md raid1/5; btrfs raid1/10
       and raid5/6 with a write-hole note; zfs raidz1/raidz3)
 
+[x] idempotent install: a re-run tears down any existing stack on the members
+    before partitioning. a new "reset" phase (after prepare, before partition)
+    runs the stack's own best-effort teardown (unmount, then lvm/md/crypt or the
+    zpool) and settles udev, so wipefs no longer fails "Device or resource busy"
+    when a prior run's crypt/md/lvm still holds the disks. shares close_phase's
+    teardown steps. md-backed stacks also sweep the array members' /sys holders,
+    so an oddly-named (md127) array on the configured disks is stopped too, not
+    only /dev/md/root by name.
+
+[x] retry the encryption password prompt on mismatch/empty instead of aborting:
+    re-asks until the entry is non-empty and (on install) matches its
+    confirmation, so a typo no longer kills a long install. the root password is
+    set by the system `passwd` in the chroot, which already re-prompts on mismatch.
+
 [ ] run the vm harness against all four stacks on a kvm host and commit
     a result-YYYY-MM.md per stack (needs a libvirt host)
 [ ] rescue boot: instrument the efi boot manager via send-key to select the

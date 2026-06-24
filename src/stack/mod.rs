@@ -510,6 +510,30 @@ pub fn md_stop(device: &str) -> Step {
     .best_effort()
 }
 
+/// best-effort: stop whatever md array currently holds any of `devices`, located
+/// via /sys/block/<dev>/holders. this catches an array assembled under a
+/// non-canonical node (eg. md127 from a hand-create or a prior boot's
+/// auto-assembly) that md_stop by the /dev/md/<name> node would miss. devices
+/// that are absent or hold no array are skipped, so passing every candidate is
+/// safe. run it after the upper layers are down and before the member devices are
+/// closed, so the array is free to stop and its members can then be released.
+pub fn md_stop_holders(devices: &[String]) -> Step {
+    Step::sh(
+        "stop any md array holding the member devices",
+        format!(
+            "for d in {}; do \
+               b=$(readlink -f \"$d\" 2>/dev/null); [ -n \"$b\" ] || continue; \
+               n=$(basename \"$b\"); \
+               for h in /sys/block/\"$n\"/holders/md*; do \
+                 [ -e \"$h\" ] && mdadm --stop \"/dev/$(basename \"$h\")\"; \
+               done; \
+             done; true",
+            devices.join(" ")
+        ),
+    )
+    .best_effort()
+}
+
 /// create the vg0/root logical volume on the given physical volume.
 pub fn lvm_create_root(pv: &str) -> Vec<Step> {
     vec![

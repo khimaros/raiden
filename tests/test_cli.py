@@ -25,9 +25,44 @@ def test_config_validate_ok(raiden):
 def test_list_phases(raiden):
     phases = raiden("install", "--list-phases").stdout.split()
     assert phases == [
-        "apt", "prepare", "partition", "format", "mount",
+        "apt", "prepare", "reset", "partition", "format", "mount",
         "strap", "bind", "install", "bootloader", "finish", "close",
     ]
+
+
+def test_install_resets_existing_stack_before_wipe(raiden):
+    # a re-run must free the member disks before wipefs, or wipefs fails with
+    # "Device or resource busy" while a prior run's crypt/md/lvm still hold them.
+    # the reset phase tears the stack down top-down (lvm -> md -> crypt), all
+    # best-effort so a first run no-ops, then settles udev before partition wipes.
+    out = raiden("install", "--dry-run").stdout
+    assert "=== phase: reset ===" in out
+    for cmd in [
+        "vgchange -a n vg0",
+        "mdadm --stop /dev/md/root",
+        "cryptsetup luksClose vda3_crypt",
+        "udevadm settle",
+    ]:
+        assert cmd in out, cmd
+    # teardown precedes the destructive wipe, and crypt is closed before the
+    # settle that precedes wipefs (udev must release the freed partitions first).
+    wipe = out.index("wipefs -a")
+    assert out.index("mdadm --stop /dev/md/root") < wipe
+    assert out.index("cryptsetup luksClose vda3_crypt") < out.index("udevadm settle") < wipe
+
+
+def test_reset_stops_oddly_named_md_holding_crypt(raiden):
+    # md_stop by the /dev/md/root node only catches the canonical name; an array
+    # assembled under a non-canonical node (md127, from a hand-create or a prior
+    # boot's auto-assembly) is found via the crypt devices' /sys holders and
+    # stopped. otherwise it keeps holding the crypt devices and the luksClose
+    # (then wipefs) fails "busy".
+    out = raiden("install", "--dry-run").stdout
+    assert "holders/md*" in out
+    assert "/dev/mapper/vda3_crypt" in out
+    sweep = out.index("holders/md*")
+    # after the vg is down (so the array can stop) and before the crypt close.
+    assert out.index("vgchange -a n vg0") < sweep < out.index("cryptsetup luksClose vda3_crypt")
 
 
 def test_install_dry_run_has_key_steps(raiden):
@@ -172,6 +207,15 @@ def test_dm_integrity_uses_builtin_integrity_algorithm(raiden):
     # be opened at boot). crc32c is the integritysetup default and always present.
     out = raiden("install", "--dry-run", "--config", INTEGRITY_EXAMPLE).stdout
     assert "integritysetup" in out and "format" in out
+
+
+def test_reset_integrity_stack_sweeps_integrity_device_holders(raiden):
+    # the integrity stack's array sits on the per-disk dm-integrity devices (md is
+    # below the single crypt), so the reset holder sweep must walk those, not a
+    # crypt device, to find and stop an oddly-named array before teardown.
+    out = raiden("install", "--dry-run", "--config", INTEGRITY_EXAMPLE).stdout
+    assert "holders/md*" in out
+    assert "/dev/mapper/vda3_int" in out
     assert "--integrity=crc32c" in out
     assert "xxhash64" not in out
 

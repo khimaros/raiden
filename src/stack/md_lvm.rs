@@ -132,6 +132,10 @@ impl Stack for MdLvm {
             Step::run("unmount /mnt", &["umount", "/mnt"]).best_effort(),
             super::lvm_deactivate(),
             super::md_stop(ROOT_MD_DEVICE),
+            // the array is built on the crypt devices; stop it by node above, and
+            // by their holders here, so an oddly-named (md127) array still frees
+            // the crypt devices before the luksClose below.
+            super::md_stop_holders(&layout.crypt_devices()),
         ];
         s.extend(super::crypt_close_disks(layout));
         s

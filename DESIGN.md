@@ -110,10 +110,21 @@ runtime value (eg. a uuid from blkid) are emitted as `sh -c`; static files are
 native write steps.
 
 the install pipeline (src/pipeline.rs) assembles phases as reusable builders --
-apt, prepare, partition, format, mount, strap, install, bootloader, finish,
-close -- so operations (src/ops.rs: rescue, replace, remove, close, scrub,
-status) compose the subset they need. `--from`/`--only` restrict the install to a
-phase; `--list-phases` prints them.
+apt, prepare, reset, partition, format, mount, strap, install, bootloader,
+finish, close -- so operations (src/ops.rs: rescue, replace, remove, close,
+scrub, status) compose the subset they need. `--from`/`--only` restrict the
+install to a phase; `--list-phases` prints them.
+
+the `reset` phase makes install re-runnable: before partitioning it tears down
+any prior stack on the members (the same best-effort `teardown_steps` that
+`close` uses -- unmount, then lvm/md/crypt or the zpool) and `udevadm settle`s,
+so wipefs does not hit "Device or resource busy" while a half-finished run still
+holds the disks. the md-backed stacks also sweep `/sys/block/<dev>/holders` of
+their array members (the crypt devices for md~lvm, the dm-integrity devices for
+the integrity stack), so an array assembled under a non-canonical node (md127,
+from a hand-create or a prior boot's auto-assembly) is stopped too -- not only
+`/dev/md/root` by name. arrays built on disks outside the configured members are
+left alone.
 
 the runner (src/step.rs) prints the plan under `--dry-run` or executes it,
 streaming command output. status (src/badblocks.rs) ports the md read-error to

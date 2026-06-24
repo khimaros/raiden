@@ -51,7 +51,7 @@ opens a `screen` session that runs `raiden init` then `raiden install`:
 - `raiden init` asks for the stack, member disks, raid level, and boot mode
   (efi/bios) -- detecting sensible defaults -- and writes `raiden.toml`.
 - `raiden install` prints the disks it will ERASE for you to confirm, asks for the
-  encryption password, then provisions.
+  encryption password (typed twice, re-prompting on a mismatch), then provisions.
 
 running inside `screen` means a dropped ssh/console connection does not abort the
 install: reconnect and `screen -r raiden` to reattach. when it finishes, `reboot`
@@ -172,6 +172,15 @@ runs without prompting. any interrupted operation can be continued with
 `raiden <op> --resume`: raiden checkpoints after every step, so resume skips
 everything already applied and continues from the next step, never re-running a
 completed one.
+
+a fresh `raiden install` (without `--resume`) is also re-runnable: it tears down
+any stack a previous attempt left on the member disks -- unmounting, then
+stopping the array and locking the crypt devices (or destroying the zpool) --
+before it repartitions, so a retry does not fail at wipefs with "Device or
+resource busy". this includes an array assembled under a non-canonical node (eg.
+`md127`) as long as it sits on the configured member disks -- raiden finds it
+through the members' `/sys` holders. an array on disks outside the member list is
+left alone.
 
 set `serial_console = true` (under `[install]`) to enable a serial console on the
 installed system -- handy for headless servers and used by the automated test

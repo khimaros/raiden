@@ -134,6 +134,10 @@ impl Stack for MdIntegrity {
             )
             .best_effort(),
             super::md_stop(ROOT_MD_DEVICE),
+            // md sits on the per-disk integrity devices here (the single crypt is
+            // above md, closed already), so sweep their holders to catch an
+            // oddly-named (md127) array before the integrity devices are closed.
+            super::md_stop_holders(&layout.int_devices()),
         ];
         s.extend(integrity_close_disks(layout));
         s
