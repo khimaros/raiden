@@ -360,6 +360,33 @@
     installs the new member-driven mirror hooks, and resyncs. dry-run by default
     (APPLY=1 to apply); backs up fstab; idempotent.
 
+[x] benchmark scratch-dir lifecycle: a Workdir RAII guard removes
+    /var/tmp/raiden-benchmark on normal return, error (`?`), and panic (a failed
+    pass used to leak the 2g working set); `new` clears a stale dir from a prior
+    killed run. a signal-hook thread (new dep, leaner than ctrlc) removes it and
+    exits 130 on SIGINT/SIGTERM, which would otherwise skip the guard's drop.
+    validated live: workdir removed on SIGINT, exit 130. progress + child chatter
+    go to stderr so `--format json` stdout stays clean.
+
+[x] bug: replace of a healthy disk failed at "recreate primary esp" with
+    "mkfs.msdos: /dev/.. contains a mounted filesystem" -- the primary esp is
+    mounted at /boot/efi on a running system, and the best-effort wipefs silently
+    skipped it before the (hard-fail) mkfs. fixed: replace now unmounts each
+    rebuilt disk's esp before wipefs/mkfs, and remounts /boot + /boot/efi from the
+    first available member afterward (pipeline::boot_mount_steps) so the running
+    system is left consistent. the corrupt_efiboot vm passed only because there
+    the esp is destroyed (unmounted) before replace.
+
+[x] verify the encryption password (prompt twice, retry on mismatch) for replace,
+    not just install: both luks-FORMAT a disk with it, so a typo silently makes a
+    member with a mismatched password that fails to unlock at boot. open-only ops
+    (rescue, mount) still prompt once (a wrong password just fails to unlock).
+[x] vm scenario replace_primary: replace the PRIMARY disk's --esp --boot on a
+    healthy system (its esp mounted at /boot/efi) -- the only coverage for the
+    mounted-esp unmount fix (corrupt_efiboot destroys the esp first; the others
+    replace non-primary unmounted-mirror disks). selectable, excluded from the
+    default bundle.
+
 [ ] run the vm harness against all four stacks on a kvm host and commit
     a result-YYYY-MM.md per stack (needs a libvirt host)
 [ ] rescue boot: instrument the efi boot manager via send-key to select the

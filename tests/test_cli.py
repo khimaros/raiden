@@ -148,6 +148,17 @@ def test_replace_esp_boot_skips_the_root_resilver(raiden):
     assert "luksFormat" not in out
 
 
+def test_replace_unmounts_the_esp_before_rebuilding_it(raiden):
+    # the primary esp is mounted at /boot/efi on a healthy system; replace must
+    # unmount it before mkfs, or mkfs.msdos refuses "contains a mounted filesystem".
+    out = raiden("replace", "--disks", "vda", "--esp", "--dry-run").stdout
+    assert "umount /dev/vda1" in out
+    assert out.index("umount /dev/vda1") < out.index("recreate primary esp on /dev/vda1")
+    # and it remounts /boot/efi afterward so the running system is left consistent.
+    assert "mountpoint -q /boot/efi" in out
+    assert out.index("recreate primary esp on /dev/vda1") < out.index("mountpoint -q /boot/efi")
+
+
 def _raid_boot_config(tmp_path):
     """a config file selecting the (opt-in) md raid1 /boot path."""
     p = tmp_path / "raid-boot.toml"

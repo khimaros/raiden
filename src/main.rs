@@ -278,7 +278,11 @@ fn obtain_password(op: &str, g: &Global) -> Result<String> {
             return Ok(pw);
         }
     }
-    prompt::read_password(op == "install")
+    // install and replace luks-FORMAT a disk with this password, so a typo would
+    // silently create a member with a mismatched password (failing to unlock at
+    // boot) -- verify those by prompting twice. open-only ops (rescue, mount) do
+    // not: a wrong password just fails to unlock, harmlessly and immediately.
+    prompt::read_password(matches!(op, "install" | "replace"))
 }
 
 fn guard(op: &str) -> Result<()> {

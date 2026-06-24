@@ -93,6 +93,27 @@ pub fn plan(b: &Bench) -> Vec<Phase> {
     vec![Phase::new("benchmark", s)]
 }
 
+/// owns the scratch dir for a run: created on `new` (after clearing any stale dir
+/// a previously killed run left, so the working set never accumulates), and
+/// removed on drop -- which covers a normal return, an error via `?`, and a panic
+/// unwind. a hard kill (SIGKILL, or SIGINT with the default disposition) skips
+/// drop, but the next run's `new` reclaims it.
+struct Workdir;
+
+impl Workdir {
+    fn new() -> Result<Self> {
+        let _ = std::fs::remove_dir_all(WORKDIR);
+        std::fs::create_dir_all(WORKDIR).with_context(|| format!("creating {WORKDIR}"))?;
+        Ok(Workdir)
+    }
+}
+
+impl Drop for Workdir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(WORKDIR);
+    }
+}
+
 /// run the benchmark for real: prepare, run every pass capturing its output,
 /// parse the durable-write metrics, and print a per-mode summary (or json).
 /// progress is narrated phase by phase on stderr (and the exact command with
@@ -107,10 +128,27 @@ pub fn run(b: &Bench, format: &str, verbose: bool) -> Result<()> {
         "benchmark: sysbench fileio (fsync-all), {} working set, {} passes per mode",
         b.size, b.passes
     );
+    // a hard interrupt (sigint/sigterm) would skip the Workdir guard's drop, so a
+    // dedicated thread removes the scratch dir and exits on the first signal.
+    // signal-hook delivers to this thread (not an async-signal handler), so
+    // remove_dir_all is safe to call here.
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])
+    .context("installing the interrupt handler")?;
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            let _ = std::fs::remove_dir_all(WORKDIR);
+            std::process::exit(130);
+        }
+    });
     // best-effort: sysbench is usually preinstalled (the harness adds it as a
     // package); install it if missing, but let a later failure report the cause.
     let _ = run_argv(&["apt-get", "install", "-y", "sysbench"]);
-    run_argv(&["mkdir", "-p", WORKDIR])?;
+    // the scratch dir is cleaned up when this guard drops (normal return, an
+    // error via `?`, or a panic unwind); a prior killed run's dir is cleared here.
+    let _scratch = Workdir::new()?;
     eprintln!(
         "benchmark: preparing the {} working set in {WORKDIR} (may take a while)...",
         b.size
@@ -146,7 +184,7 @@ pub fn run(b: &Bench, format: &str, verbose: bool) -> Result<()> {
             p95_ms: mean(&p95s),
         });
     }
-    let _ = run_argv(&["rm", "-rf", WORKDIR]);
+    // _scratch drops here, removing the working set.
 
     if json {
         print_json(b, &results);

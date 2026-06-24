@@ -157,6 +157,22 @@ pub fn replace(
     if parts.root {
         rm.extend(stack.remove(cfg, layout, disks));
     }
+    if parts.esp {
+        // the primary esp is mounted at /boot/efi on a healthy system; unmount the
+        // esp of any disk being rebuilt before wipefs/mkfs touch it, or mkfs.msdos
+        // refuses ("contains a mounted filesystem"). best-effort: a mirror esp or a
+        // destroyed primary is not mounted.
+        for d in disks {
+            let esp = layout.part(d, 1);
+            rm.push(
+                Step::run_owned(
+                    format!("unmount {esp} if mounted"),
+                    vec!["umount".to_string(), esp],
+                )
+                .best_effort(),
+            );
+        }
+    }
     // udev releases the just-closed crypt/dm devices asynchronously; settle before
     // wiping and repartitioning so the freed partitions are not still "busy".
     rm.push(Step::run("settle udev after teardown", &["udevadm", "settle"]).best_effort());
@@ -234,7 +250,13 @@ pub fn replace(
         Phase::new("partition", pt),
         Phase::new("reassemble", re),
     ];
-    let boot = repopulate_boot(layout, disks, &healthy[0], efi, parts);
+    let mut boot = repopulate_boot(layout, disks, &healthy[0], efi, parts);
+    // the esp was unmounted for the rebuild; remount /boot + /boot/efi from the
+    // first available member so the running system is left consistent (idempotent;
+    // a no-op for whatever is already mounted).
+    if parts.esp || parts.boot {
+        boot.extend(pipeline::boot_mount_steps(layout, "/", efi));
+    }
     if !boot.is_empty() {
         phases.push(Phase::new("bootloader", boot));
     }

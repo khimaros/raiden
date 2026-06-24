@@ -1,6 +1,6 @@
 [package]
 name = "raiden"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "provision and maintain full-disk-encrypted RAID systems on Debian"
 license = "MIT"
@@ -15,6 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 anyhow = "1.0"
 regex = "1.11"
+signal-hook = "0.4.4"
 
 [profile.release]
 strip = true

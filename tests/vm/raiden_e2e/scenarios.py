@@ -65,11 +65,10 @@ class Session:
         if rc != 0:
             raise RuntimeError(f"scrub failed (rc={rc}): {_tail(out)}")
 
-    def replace(self, disks: list[str]) -> None:
-        log(f"replacing disks: {', '.join(disks)}")
-        rc, out = self.raiden(
-            f"replace --yes --password-file {PWFILE} --disks {','.join(disks)}", timeout=10800
-        )
+    def replace(self, disks: list[str], parts: str = "") -> None:
+        log(f"replacing disks: {', '.join(disks)} {parts}".rstrip())
+        args = f"replace --yes --password-file {PWFILE} --disks {','.join(disks)} {parts}".rstrip()
+        rc, out = self.raiden(args, timeout=10800)
         if rc != 0:
             raise RuntimeError(f"replace failed (rc={rc}): {_tail(out)}")
 
@@ -193,8 +192,33 @@ def corrupt_efiboot(s: Session) -> None:
     s.reboot_login()
 
 
+def replace_primary(s: Session) -> None:
+    """replace the PRIMARY disk on a healthy system. its esp is mounted at
+    /boot/efi, so replace must unmount it before mkfs -- without that fix,
+    mkfs.msdos fails with 'contains a mounted filesystem'. the other scenarios
+    only replace non-primary disks (whose esp mirrors are unmounted under option
+    a), so this is the only coverage. --esp --boot rebuilds just the boot region
+    (no slow root resilver), which is where the bug lives; the root array stays
+    intact."""
+    scen = "replace healthy primary"
+    primary = s.members()[0]
+    _, out = s.c.run("mountpoint -q /boot/efi && echo MOUNTED || echo absent")
+    s.report.add(scen, "esp mounted", PASS if "MOUNTED" in out else WARN, _tail(out))
+    s.replace([primary], "--esp --boot")  # raises on the bug
+    s.report.add(scen, "replace", PASS, "primary boot region rebuilt with esp mounted")
+    s.reboot_login()
+    s.report.add(scen, "reboot", PASS, "booted after primary replace")
+
+
 # every in-place scenario, in run order. selectable individually with --scenario.
-INPLACE = [sysbench, corrupt_data_within, corrupt_headers, truncate_disks, corrupt_efiboot]
+INPLACE = [
+    sysbench,
+    corrupt_data_within,
+    corrupt_headers,
+    truncate_disks,
+    corrupt_efiboot,
+    replace_primary,
+]
 
 # the default bundled run excludes corrupt_efiboot: run last after several
 # corrupt+repair cycles, a boot failure there would be confounded by accumulated
