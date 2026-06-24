@@ -9,16 +9,10 @@ pub const ROOT_MD_NAME: &str = "root";
 pub const ROOT_MD_DEVICE: &str = "/dev/md/root";
 pub const ZPOOL_NAME: &str = "rpool";
 
-// /boot/efi is a symlink to the active esp's per-slot mount; grub-install and the
-// mirror hook use this one stable path, and a dead primary is failed over by
-// re-pointing the link rather than editing fstab.
-pub const ESP_LINK: &str = "/boot/efi";
-
-// the live /boot mount. in independent mode the other disks' /boot copies mount
-// noauto at /boot.mirrorN (siblings, so the sync rsync --one-file-system never
-// recurses into the nested esp mounts or a mirror into itself).
-pub const BOOT_MOUNT: &str = "/boot";
-const BOOT_MIRROR_PREFIX: &str = "/boot.mirror";
+// the primary member's esp is mounted here directly (by uuid). the other members'
+// esps are mirrors, resynced from this one via transient mounts under /run/raiden,
+// so neither / nor /boot carries a per-disk esp mount point.
+pub const ESP_MOUNT: &str = "/boot/efi";
 
 // partition numbers on each member disk.
 const PART_ESP: u32 = 1;
@@ -31,23 +25,6 @@ const PART_ROOT: u32 = 3;
 pub enum BootMode {
     Raid,
     Independent,
-}
-
-/// stable per-slot /boot mount for the disk at the given member index (independent
-/// mode). slot 0 is the live primary (/boot); the rest are /boot.mirrorN mirrors.
-fn boot_mount(i: usize) -> String {
-    if i == 0 {
-        BOOT_MOUNT.to_string()
-    } else {
-        format!("{}{}", BOOT_MIRROR_PREFIX, i + 1)
-    }
-}
-
-/// stable per-slot esp mount point for the disk at the given member index. every
-/// disk's esp has its own /boot/efiN (1-indexed); /boot/efi (ESP_LINK) is a
-/// symlink to whichever slot is the current primary.
-fn esp_mount(i: usize) -> String {
-    format!("/boot/efi{}", i + 1)
 }
 
 pub struct Layout {
@@ -94,28 +71,10 @@ impl Layout {
         self.parts(PART_ROOT)
     }
 
-    /// per-slot esp mount points (/boot/efi1../boot/efiN). positional, so a disk
-    /// maps to the same slot every run; the first is the primary (auto), the rest
-    /// are noauto mirrors. /boot/efi (ESP_LINK) symlinks to the primary.
-    pub fn esp_mounts(&self) -> Vec<String> {
-        (0..self.members.len()).map(esp_mount).collect()
-    }
-
-    /// the primary esp mount: the symlink target of /boot/efi by default.
-    pub fn esp_primary(&self) -> String {
-        esp_mount(0)
-    }
-
-    /// esp mount slot for a specific disk, by its position in the full member
-    /// list -- so replace targets the same slot it had at install.
-    pub fn esp_mount_of(&self, disk: &str) -> Option<String> {
-        self.members.iter().position(|m| m == disk).map(esp_mount)
-    }
-
-    /// per-slot /boot mount points (independent mode): [/boot, /boot.mirror2, ...].
-    /// the first is the live primary (auto), the rest are noauto mirrors.
-    pub fn boot_mounts(&self) -> Vec<String> {
-        (0..self.members.len()).map(boot_mount).collect()
+    /// whether `disk` holds the primary esp (the first member) -- the one mounted
+    /// at /boot/efi; the rest are mirrors resynced from it.
+    pub fn esp_is_primary(&self, disk: &str) -> bool {
+        self.members.first().map(|m| m == disk).unwrap_or(false)
     }
 
     /// a layout over a subset of the members (eg. the disks being replaced),
@@ -182,18 +141,14 @@ mod tests {
     }
 
     #[test]
-    fn esp_mounts_are_stable_per_slot() {
+    fn esp_primary_is_the_first_member() {
         let l = layout_with(&["vda", "vdb", "vdc"], "");
-        assert_eq!(l.esp_mounts(), ["/boot/efi1", "/boot/efi2", "/boot/efi3"]);
-        assert_eq!(l.esp_primary(), "/boot/efi1");
-        assert_eq!(l.esp_mount_of("vdb").as_deref(), Some("/boot/efi2"));
-    }
-
-    #[test]
-    fn boot_mounts_put_primary_at_boot_then_mirrors() {
-        let l = layout_with(&["vda", "vdb", "vdc"], "");
+        // the primary esp (mounted at /boot/efi) is the first member's p1; the
+        // others are mirrors, synced from it.
+        assert_eq!(l.esp_devices(), ["/dev/vda1", "/dev/vdb1", "/dev/vdc1"]);
+        assert!(l.esp_is_primary("vda"));
+        assert!(!l.esp_is_primary("vdb"));
         assert!(!l.boot_raid()); // default config is independent
-        assert_eq!(l.boot_mounts(), ["/boot", "/boot.mirror2", "/boot.mirror3"]);
     }
 
     #[test]

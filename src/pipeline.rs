@@ -4,7 +4,7 @@
 // (static content) or as `sh -c` (when a runtime uuid from blkid is needed).
 
 use crate::config::Config;
-use crate::layout::{Layout, BOOT_MD_DEVICE, BOOT_MD_NAME, ESP_LINK};
+use crate::layout::{Layout, BOOT_MD_DEVICE, BOOT_MD_NAME, ESP_MOUNT};
 use crate::stack::{self, Stack};
 use crate::state::State;
 use crate::step::{Phase, Step};
@@ -30,6 +30,11 @@ pub const PHASES: &[&str] = &[
 const EFI_OPTS: &str =
     "rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro";
 
+// where the raiden binary is staged in the installed system, so post-install ops
+// (status/scrub/replace/remove/close/rescue) are available after reboot. sbin
+// because raiden is a root-only tool, matching the boot-mirror script's location.
+const RAIDEN_TARGET_BIN: &str = "/usr/local/sbin/raiden";
+
 /// the full install pipeline for the configured stack. when `auto_root_password`
 /// is set (an unattended run with a password source), the root password is set
 /// non-interactively to the disk password; otherwise raiden prompts for it.
@@ -38,6 +43,7 @@ pub fn install(
     layout: &Layout,
     stack: &dyn Stack,
     auto_root_password: bool,
+    raiden_bin: Option<&str>,
 ) -> Vec<Phase> {
     vec![
         apt_phase(cfg, stack),
@@ -53,7 +59,7 @@ pub fn install(
         bind_phase(cfg, layout),
         install_base_phase(cfg, stack, auto_root_password),
         bootloader_phase(cfg, layout),
-        finish_phase(cfg, layout, stack),
+        finish_phase(cfg, layout, stack, raiden_bin),
         close_phase(cfg, layout, stack),
     ]
 }
@@ -61,7 +67,12 @@ pub fn install(
 /// the stack's finish steps plus the install manifest, written into the target
 /// while /mnt is still mounted so it persists into the installed system. ops on
 /// the running system resolve their config from this manifest.
-fn finish_phase(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Phase {
+fn finish_phase(
+    cfg: &Config,
+    layout: &Layout,
+    stack: &dyn Stack,
+    raiden_bin: Option<&str>,
+) -> Phase {
     let mut s = stack.finish(cfg, layout);
     let manifest = State::from_config(cfg).to_toml();
     s.push(Step::run(
@@ -78,6 +89,23 @@ fn finish_phase(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Phase {
         "/mnt/boot/raiden/state.toml",
         manifest,
     ));
+    // stage the running binary alongside the manifest, so the post-install ops
+    // that read the manifest are actually present on the installed system. the
+    // distributed binary is a static musl build, so it runs in the target with no
+    // shared libs (a dynamically linked dev build copied here may not).
+    if let Some(bin) = raiden_bin {
+        s.push(Step::run_owned(
+            "install the raiden binary into the target",
+            vec![
+                "install".to_string(),
+                "-D".to_string(),
+                "-m".to_string(),
+                "0755".to_string(),
+                bin.to_string(),
+                format!("/mnt{RAIDEN_TARGET_BIN}"),
+            ],
+        ));
+    }
     // independent /boot: with the final initrd and the manifest now in /boot, push
     // them to every mirror so a survivor boots an identical, working /boot.
     if !layout.boot_raid() {
@@ -272,6 +300,38 @@ fn format_boot_independent(boot: &[String]) -> Vec<Step> {
     s
 }
 
+/// mount `/boot` and (efi) `/boot/efi` under `at`, each from the first available
+/// member and skipping whatever is already mounted (so it is idempotent). shared
+/// by install's bind, by rescue, and by the `mount` op -- so all three tolerate a
+/// missing primary by falling through to a surviving copy. the primary esp mounts
+/// directly at `/boot/efi`; the others are mirrors with no mount point.
+pub fn boot_mount_steps(layout: &Layout, at: &str, efi: bool) -> Vec<Step> {
+    let at = at.trim_end_matches('/');
+    let mut s = Vec::new();
+    if layout.boot_raid() {
+        s.push(Step::sh(
+            format!("mount {at}/boot (md array)"),
+            format!(
+                "mkdir -p {at}/boot; mountpoint -q {at}/boot || mount {BOOT_MD_DEVICE} {at}/boot"
+            ),
+        ));
+    } else {
+        let devs = layout.boot_devices().join(" ");
+        s.push(Step::sh(
+            format!("mount {at}/boot from the first available member"),
+            format!("mkdir -p {at}/boot; mountpoint -q {at}/boot || for d in {devs}; do [ -b \"$d\" ] && mount \"$d\" {at}/boot && break; done"),
+        ));
+    }
+    if efi {
+        let devs = layout.esp_devices().join(" ");
+        s.push(Step::sh(
+            format!("mount {at}/boot/efi from the first available esp"),
+            format!("mkdir -p {at}/boot/efi; mountpoint -q {at}/boot/efi || for d in {devs}; do [ -b \"$d\" ] && mount \"$d\" {at}/boot/efi 2>/dev/null && break; done"),
+        ));
+    }
+    s
+}
+
 pub fn bind_phase(cfg: &Config, layout: &Layout) -> Phase {
     // debootstrap already creates these, but mkdir -p keeps bind robust.
     let mut s = vec![Step::run(
@@ -296,48 +356,11 @@ pub fn bind_phase(cfg: &Config, layout: &Layout) -> Phase {
             ],
         )
     }));
-    s.push(Step::run("create /mnt/boot", &["mkdir", "-p", "/mnt/boot"]));
-    if layout.boot_raid() {
-        s.push(Step::run(
-            "mount /boot",
-            &["mount", BOOT_MD_DEVICE, "/mnt/boot"],
-        ));
-    } else {
-        // mount the first member's independent /boot; every copy shares one uuid.
-        let dev = layout.boot_devices().into_iter().next().unwrap_or_default();
-        s.push(Step::run_owned(
-            "mount /boot",
-            vec!["mount".to_string(), dev, "/mnt/boot".to_string()],
-        ));
-    }
-    if cfg.install.boot_mode == "efi" {
-        let primary = layout.esp_primary(); // /boot/efi1
-        s.push(Step::run_owned(
-            format!("create {primary} mount point"),
-            vec![
-                "mkdir".to_string(),
-                "-p".to_string(),
-                format!("/mnt{primary}"),
-            ],
-        ));
-        let esp0 = layout.esp_devices().into_iter().next().unwrap_or_default();
-        s.push(Step::run_owned(
-            "mount the primary esp",
-            vec!["mount".to_string(), esp0, format!("/mnt{primary}")],
-        ));
-        // /boot/efi is a relative symlink to the active esp so grub-install and
-        // the mirror hook share one stable path; re-point it to fail over.
-        let target = primary.trim_start_matches("/boot/").to_string(); // efi1
-        s.push(Step::run_owned(
-            format!("link {} -> {target}", ESP_LINK),
-            vec![
-                "ln".to_string(),
-                "-sfn".to_string(),
-                target,
-                format!("/mnt{ESP_LINK}"),
-            ],
-        ));
-    }
+    s.extend(boot_mount_steps(
+        layout,
+        "/mnt",
+        cfg.install.boot_mode == "efi",
+    ));
     Phase::new(BIND, s)
 }
 
@@ -538,15 +561,13 @@ fn boot_fstab_step(layout: &Layout) -> Step {
     }
 }
 
-/// independent /boot: fstab mirror entries plus the sync script and its kernel
-/// hooks. each non-primary member's /boot mounts noauto at /boot.mirrorN by
-/// device (so the sync writes each physical disk, not whatever uuid resolves
-/// first); the live /boot is mounted by the shared uuid (see boot_fstab_step).
+/// independent /boot: install the member-driven sync script and its kernel hooks.
+/// the mirrors have no fstab entry -- the script mounts each physical disk's /boot
+/// transiently under /run/raiden to resync (the live /boot uses the shared uuid).
 fn boot_mirror_install_steps(layout: &Layout) -> Vec<Step> {
-    let mut s = boot_mirror_fstab_steps(layout);
     // the script and hook dirs exist in a base install, but mkdir -p keeps this
     // robust (Step::write does not create parent dirs).
-    s.push(Step::run(
+    let mut s = vec![Step::run(
         "create the boot mirror script and hook dirs",
         &[
             "mkdir",
@@ -555,11 +576,11 @@ fn boot_mirror_install_steps(layout: &Layout) -> Vec<Step> {
             "/mnt/etc/kernel/postinst.d",
             "/mnt/etc/kernel/postrm.d",
         ],
-    ));
+    )];
     s.push(Step::write_mode(
         "install the boot mirror sync script",
         format!("/mnt{}", stack::BOOT_MIRROR_SYNC_PATH),
-        stack::BOOT_MIRROR_SYNC,
+        stack::boot_mirror_sync(&layout.boot_devices()),
         0o755,
     ));
     // the hooks run after zz-update-grub, so each new kernel/initrd and the
@@ -576,25 +597,6 @@ fn boot_mirror_install_steps(layout: &Layout) -> Vec<Step> {
         ));
     }
     s
-}
-
-/// fstab lines for every non-primary member's /boot mirror, addressed by device.
-fn boot_mirror_fstab_steps(layout: &Layout) -> Vec<Step> {
-    let devices = layout.boot_devices();
-    let mounts = layout.boot_mounts();
-    devices
-        .iter()
-        .zip(mounts.iter())
-        .skip(1)
-        .map(|(dev, mnt)| {
-            Step::sh(
-                format!("add boot mirror {mnt} to fstab"),
-                format!(
-                    "mkdir -p /mnt{mnt}; echo \"{dev} {mnt} ext4 noauto,nofail 0 0\" >> /mnt/etc/fstab"
-                ),
-            )
-        })
-        .collect()
 }
 
 // grub serial config so the installed system's boot menu, kernel console, and
@@ -659,35 +661,23 @@ fn bootloader_efi(layout: &Layout) -> Vec<Step> {
     s.push(Step::write_mode(
         "install the esp mirror grub.d hook",
         "/mnt/etc/grub.d/90_copy_to_efi_mirrors",
-        stack::EFI_MIRROR_HOOK,
+        stack::efi_mirror_hook(&layout.esp_devices()),
         0o755,
     ));
     s
 }
 
-/// fstab entries for every esp: the first (the /boot/efi symlink target) is the
-/// auto primary, the rest are noauto mirrors. each uuid is resolved via blkid.
+/// the single esp fstab entry: the primary member's esp at /boot/efi by uuid
+/// (nofail). the other members' esps are mirrors with no fstab entry -- the
+/// grub.d hook mounts them transiently under /run/raiden to resync.
 fn esp_fstab_steps(layout: &Layout) -> Vec<Step> {
-    let devices = layout.esp_devices();
-    let mounts = layout.esp_mounts();
-    devices
-        .iter()
-        .zip(mounts.iter())
-        .enumerate()
-        .map(|(i, (dev, mnt))| {
-            if i == 0 {
-                Step::sh(
-                    format!("add {mnt} to fstab"),
-                    format!("uuid=$(blkid -s UUID -o value {dev}); echo \"UUID=$uuid {mnt} vfat {EFI_OPTS},nofail 0 0\" >> /mnt/etc/fstab"),
-                )
-            } else {
-                Step::sh(
-                    format!("add esp mirror {mnt} to fstab"),
-                    format!("mkdir -p /mnt{mnt}; uuid=$(blkid -s UUID -o value {dev}); echo \"UUID=$uuid {mnt} vfat {EFI_OPTS},noauto 0 0\" >> /mnt/etc/fstab"),
-                )
-            }
-        })
-        .collect()
+    let Some(primary) = layout.esp_devices().into_iter().next() else {
+        return Vec::new();
+    };
+    vec![Step::sh(
+        format!("add {ESP_MOUNT} to fstab"),
+        format!("uuid=$(blkid -s UUID -o value {primary}); echo \"UUID=$uuid {ESP_MOUNT} vfat {EFI_OPTS},nofail 0 0\" >> /mnt/etc/fstab"),
+    )]
 }
 
 /// tear down any existing stack on the member disks: lazily unmount everything

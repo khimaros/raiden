@@ -1,10 +1,10 @@
-// map raid read errors reported by md to the files they affect. the integrity
-// layer (dm-integrity or dm-crypt aead) sits below md and only knows sectors,
-// while ext4 sits above md and never sees the error while redundancy holds. md
-// bridges the two: it logs the failing member device and sector, which we
-// reverse-map through the raid stripe and the linear dmsetup offsets to ext4
-// blocks, then to paths via debugfs. ported from badblocks.sh; keys off generic
-// md geometry, so it works for both md stacks.
+// map raid read errors reported by md to the bad files they affect (surfaced by
+// `status` and `status --bad-files`). the integrity layer (dm-integrity or
+// dm-crypt aead) sits below md and only knows sectors, while ext4 sits above md
+// and never sees the error while redundancy holds. md bridges the two: it logs
+// the failing member device and sector, which we reverse-map through the raid
+// stripe and the linear dmsetup offsets to ext4 blocks, then to paths via
+// debugfs. keys off generic md geometry, so it works for both md stacks.
 
 use std::path::Path;
 use std::process::Command;

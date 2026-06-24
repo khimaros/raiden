@@ -29,6 +29,27 @@ pub fn close(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Vec<Phase> {
     vec![pipeline::close_phase(cfg, layout, stack)]
 }
 
+/// ensure the stack is open and mounted. the full form (under /mnt) opens crypt,
+/// assembles the array, activates lvm, and mounts root plus /boot and /boot/efi;
+/// `boot_only` mounts just /boot and /boot/efi under `at` (no crypt, no password).
+/// every step is guarded, so it is safe to run against an already-up system.
+pub fn mount(
+    cfg: &Config,
+    layout: &Layout,
+    stack: &dyn Stack,
+    boot_only: bool,
+    at: &str,
+) -> Vec<Phase> {
+    let efi = cfg.install.boot_mode == "efi";
+    let mut s = Vec::new();
+    if !boot_only {
+        s.extend(stack.map(cfg, layout));
+        s.extend(stack.mount_root(cfg, layout));
+    }
+    s.extend(pipeline::boot_mount_steps(layout, at, efi));
+    vec![Phase::new("mount", s)]
+}
+
 pub fn scrub(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Vec<Phase> {
     // independent /boot is a plain ext4 per disk with no array to scrub.
     let mut s = Vec::new();
@@ -64,13 +85,52 @@ pub fn remove(
     Ok(vec![Phase::new("remove", s)])
 }
 
-/// rebuild the named disks: detach, repartition them, re-add to the arrays, and
-/// repopulate their esps.
+/// which per-disk layers a replace rebuilds. no layer flag means all of them (the
+/// whole disk); naming layers rebuilds only those -- eg. `--esp --boot` rebuilds
+/// the boot region without touching the root member, so there is no resilver.
+pub struct ReplaceParts {
+    pub esp: bool,
+    pub boot: bool,
+    pub root: bool,
+}
+
+impl ReplaceParts {
+    pub fn from_flags(esp: bool, boot: bool, root: bool) -> Self {
+        if !esp && !boot && !root {
+            Self {
+                esp: true,
+                boot: true,
+                root: true,
+            }
+        } else {
+            Self { esp, boot, root }
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.esp && self.boot && self.root
+    }
+
+    /// the member partition numbers selected (1=esp, 2=boot, 3=root).
+    fn part_numbers(&self) -> Vec<u32> {
+        [(self.esp, 1u32), (self.boot, 2), (self.root, 3)]
+            .into_iter()
+            .filter_map(|(sel, n)| sel.then_some(n))
+            .collect()
+    }
+}
+
+/// rebuild the named disks' selected layers: detach, repartition, re-add to the
+/// arrays, and repopulate boot/esp. a full (default) replace rebuilds the whole
+/// disk; a partial one (eg. `--esp --boot`) rebuilds only those partitions in
+/// place and leaves the root member -- and its array -- untouched, so it skips the
+/// (slow) resilver.
 pub fn replace(
     cfg: &Config,
     layout: &Layout,
     stack: &dyn Stack,
     disks: &[String],
+    parts: &ReplaceParts,
 ) -> Result<Vec<Phase>> {
     check_members(layout, disks)?;
     let healthy: Vec<String> = layout
@@ -83,23 +143,25 @@ pub fn replace(
         bail!("cannot replace every disk at once; at least one member must survive to clone from");
     }
     let efi = cfg.install.boot_mode == "efi";
-    let repl = layout.subset(disks);
 
-    // remove: detach from both arrays, tear down mappings, wipe the disks.
-    let mut rm = boot_detach(layout, disks);
-    // independent /boot mounts by the shared uuid, so the live /boot may sit on a
-    // disk we are about to repartition; move it to a survivor first.
-    if !layout.boot_raid() {
-        rm.push(relocate_boot_step(layout, disks, &healthy[0]));
+    // remove: detach the selected layers and wipe their partitions.
+    let mut rm = Vec::new();
+    if parts.boot {
+        rm.extend(boot_detach(layout, disks));
+        // independent /boot mounts by the shared uuid, so the live /boot may sit on
+        // a disk we are about to rebuild; move it to a survivor first.
+        if !layout.boot_raid() {
+            rm.push(relocate_boot_step(layout, disks, &healthy[0]));
+        }
     }
-    rm.extend(stack.remove(cfg, layout, disks));
+    if parts.root {
+        rm.extend(stack.remove(cfg, layout, disks));
+    }
     // udev releases the just-closed crypt/dm devices asynchronously; settle before
-    // wiping and repartitioning so the freed partitions are not still "busy" at
-    // wipefs/mkfs/luksFormat (an intermittent failure when replacing a member
-    // whose root layer was still healthy, eg. after losing only its esp+boot).
+    // wiping and repartitioning so the freed partitions are not still "busy".
     rm.push(Step::run("settle udev after teardown", &["udevadm", "settle"]).best_effort());
     for d in disks {
-        for p in [1, 2, 3] {
+        for p in parts.part_numbers() {
             let dev = layout.part(d, p);
             rm.push(
                 Step::run_owned(
@@ -111,48 +173,53 @@ pub fn replace(
         }
     }
 
-    // partition: recreate gpt + esp/boot on the replacements, preserving esp
-    // uuid so baked fstab entries stay valid, then bring up the root layer.
-    let mut pt = partition_replacements(layout, disks, efi);
-    pt.extend(stack.partition_root(cfg, &repl));
+    // partition: recreate the selected partitions (full = zap + recreate all;
+    // partial = recreate just those in place), then bring up the root layer.
+    let mut pt = partition_replacements(layout, disks, efi, parts);
+    if parts.root {
+        pt.extend(stack.partition_root(cfg, &layout.subset(disks)));
+    }
 
-    // reassemble: re-add boot members, then re-add root members and resilver.
-    // settle first so udev has finished probing the just-recreated partitions
-    // (otherwise the immediate --add can hit a transient "busy").
+    // reassemble: re-add the selected boot/root members and resilver. settle first
+    // so udev has finished probing the just-recreated partitions.
     let mut re =
         vec![Step::run("settle udev after repartitioning", &["udevadm", "settle"]).best_effort()];
-    if layout.boot_raid() {
-        re.extend(disks.iter().map(|d| {
-            let bdev = layout.part(d, 2);
-            Step::run_owned(
-                format!("add {bdev} to the boot array"),
-                vec![
-                    "mdadm".to_string(),
-                    "--add".to_string(),
-                    BOOT_MD_DEVICE.to_string(),
-                    bdev,
-                ],
-            )
-        }));
-    } else {
-        // no array: re-create each replaced disk's /boot with the shared uuid (so
-        // its grub finds a local copy); content is cloned in the bootloader phase.
-        let src = layout.part(&healthy[0], 2);
-        re.extend(disks.iter().map(|d| {
-            let bdev = layout.part(d, 2);
-            Step::sh(
-                format!("format {bdev} as ext4 sharing the /boot uuid"),
-                format!(
-                    "u=$(blkid -s UUID -o value {src}); mkfs.ext4 -m 0 -F -U \"$u\" -L boot {bdev}"
-                ),
-            )
-        }));
+    if parts.boot {
+        if layout.boot_raid() {
+            re.extend(disks.iter().map(|d| {
+                let bdev = layout.part(d, 2);
+                Step::run_owned(
+                    format!("add {bdev} to the boot array"),
+                    vec![
+                        "mdadm".to_string(),
+                        "--add".to_string(),
+                        BOOT_MD_DEVICE.to_string(),
+                        bdev,
+                    ],
+                )
+            }));
+        } else {
+            // no array: re-create each replaced disk's /boot with the shared uuid
+            // (so its grub finds a local copy); content is cloned in the bootloader
+            // phase.
+            let src = layout.part(&healthy[0], 2);
+            re.extend(disks.iter().map(|d| {
+                let bdev = layout.part(d, 2);
+                Step::sh(
+                    format!("format {bdev} as ext4 sharing the /boot uuid"),
+                    format!(
+                        "u=$(blkid -s UUID -o value {src}); mkfs.ext4 -m 0 -F -U \"$u\" -L boot {bdev}"
+                    ),
+                )
+            }));
+        }
     }
-    re.extend(stack.replace(cfg, layout, disks));
-    if layout.boot_raid() {
+    if parts.root {
+        re.extend(stack.replace(cfg, layout, disks));
+    }
+    if parts.boot && layout.boot_raid() {
         // stack.replace already waits for the root array; wait for the boot array
-        // too. returning with /boot mid-rebuild leaves it unreadable by grub (and
-        // unsurvivable to a further fault) until resync silently finishes later.
+        // too. returning with /boot mid-rebuild leaves it unreadable by grub.
         re.push(
             Step::run(
                 "wait for the boot array rebuild",
@@ -167,7 +234,7 @@ pub fn replace(
         Phase::new("partition", pt),
         Phase::new("reassemble", re),
     ];
-    let boot = repopulate_boot(layout, disks, &healthy[0], efi);
+    let boot = repopulate_boot(layout, disks, &healthy[0], efi, parts);
     if !boot.is_empty() {
         phases.push(Phase::new("bootloader", boot));
     }
@@ -259,37 +326,84 @@ fn relocate_boot_step(layout: &Layout, disks: &[String], survivor: &str) -> Step
     )
 }
 
-fn partition_replacements(layout: &Layout, disks: &[String], efi: bool) -> Vec<Step> {
+fn partition_replacements(
+    layout: &Layout,
+    disks: &[String],
+    efi: bool,
+    parts: &ReplaceParts,
+) -> Vec<Step> {
     let mut s = Vec::new();
+    let esp_part = |dev: &str| {
+        if efi {
+            sgdisk(dev, "create esp", "-n1:1M:+512M", "-t1:EF00")
+        } else {
+            sgdisk(dev, "create bios-boot", "-n1:1M:+16M", "-t1:EF02")
+        }
+    };
     for d in disks {
         let dev = format!("/dev/{d}");
-        s.push(Step::run_owned(
-            format!("zap gpt on {dev}"),
-            vec!["sgdisk".to_string(), "--zap-all".to_string(), dev.clone()],
-        ));
-        if efi {
-            s.push(sgdisk(&dev, "create esp", "-n1:1M:+512M", "-t1:EF00"));
+        if parts.full() {
+            s.push(Step::run_owned(
+                format!("zap gpt on {dev}"),
+                vec!["sgdisk".to_string(), "--zap-all".to_string(), dev.clone()],
+            ));
+            s.push(esp_part(&dev));
+            s.push(sgdisk(
+                &dev,
+                "create boot member",
+                "-n2:0:+512M",
+                "-t2:8301",
+            ));
         } else {
-            s.push(sgdisk(&dev, "create bios-boot", "-n1:1M:+16M", "-t1:EF02"));
+            // partial: recreate only the selected partitions in place, leaving the
+            // gpt and the unselected partitions (and their uuids) untouched.
+            if parts.esp {
+                s.push(sgdisk_delete(&dev, 1));
+                s.push(esp_part(&dev));
+            }
+            if parts.boot {
+                s.push(sgdisk_delete(&dev, 2));
+                s.push(sgdisk(
+                    &dev,
+                    "create boot member",
+                    "-n2:0:+512M",
+                    "-t2:8301",
+                ));
+            }
+            if parts.root {
+                // stack.partition_root recreates p3; just clear the old one first.
+                s.push(sgdisk_delete(&dev, 3));
+            }
         }
-        s.push(sgdisk(
-            &dev,
-            "create boot member",
-            "-n2:0:+512M",
-            "-t2:8301",
-        ));
     }
-    if efi {
+    if efi && parts.esp {
         for d in disks {
-            if let Some(mnt) = layout.esp_mount_of(d) {
-                let esp = layout.part(d, 1);
+            let esp = layout.part(d, 1);
+            if layout.esp_is_primary(d) {
+                // the primary esp is the one in fstab at /boot/efi; keep its uuid
+                // so that entry stays valid. the others are mirrors (no fstab
+                // entry, fresh uuid) repopulated from a survivor by the esp hook.
                 s.push(Step::sh(
-                    format!("recreate esp on {esp} preserving its uuid"),
+                    format!("recreate primary esp on {esp} preserving its uuid"),
                     format!(
-                        "uuid=$(awk -v m={mnt} '$2==m {{print $1}}' /etc/fstab | sed 's/^UUID=//'); \
+                        "uuid=$(awk '$2==\"/boot/efi\" {{print $1}}' /etc/fstab | sed 's/^UUID=//'); \
                          if [ -n \"$uuid\" ]; then mkfs.msdos -F 32 -s 1 -n EFI -i \"$(echo $uuid | tr -d -)\" {esp}; \
                          else mkfs.msdos -F 32 -s 1 -n EFI {esp}; fi"
                     ),
+                ));
+            } else {
+                s.push(Step::run_owned(
+                    format!("recreate esp on {esp}"),
+                    vec![
+                        "mkfs.msdos".to_string(),
+                        "-F".to_string(),
+                        "32".to_string(),
+                        "-s".to_string(),
+                        "1".to_string(),
+                        "-n".to_string(),
+                        "EFI".to_string(),
+                        esp,
+                    ],
                 ));
             }
         }
@@ -297,11 +411,19 @@ fn partition_replacements(layout: &Layout, disks: &[String], efi: bool) -> Vec<S
     s
 }
 
-/// repopulate each replaced disk's esp by cloning a surviving one, then register
-/// its firmware boot entry (efi) or reinstall grub (bios).
-fn repopulate_boot(layout: &Layout, disks: &[String], healthy: &str, efi: bool) -> Vec<Step> {
+/// repopulate the rebuilt boot layers: clone the esp from a survivor and register
+/// its firmware boot entry (efi, when the esp was rebuilt), reinstall grub (bios,
+/// when the bios-boot or /boot partition was rebuilt), and clone the independent
+/// /boot (when it was rebuilt).
+fn repopulate_boot(
+    layout: &Layout,
+    disks: &[String],
+    healthy: &str,
+    efi: bool,
+    parts: &ReplaceParts,
+) -> Vec<Step> {
     let mut s = Vec::new();
-    if efi {
+    if efi && parts.esp {
         let src = layout.part(healthy, 1);
         for d in disks {
             let dst = layout.part(d, 1);
@@ -330,7 +452,9 @@ fn repopulate_boot(layout: &Layout, disks: &[String], healthy: &str, efi: bool) 
                 ],
             ));
         }
-    } else {
+    } else if !efi && (parts.esp || parts.boot) {
+        // bios: the bootloader spans the bios-boot partition (p1) and /boot (p2),
+        // so reinstall grub if either was rebuilt.
         for d in disks {
             s.push(Step::run_owned(
                 format!("install grub to {d}"),
@@ -338,9 +462,9 @@ fn repopulate_boot(layout: &Layout, disks: &[String], healthy: &str, efi: bool) 
             ));
         }
     }
-    // independent /boot: clone the live /boot onto each replaced disk's freshly
-    // formatted boot partition so its (now bootable) grub has a local copy.
-    if !layout.boot_raid() {
+    // independent /boot: clone the live /boot onto each rebuilt boot partition so
+    // its (now bootable) grub has a local copy.
+    if parts.boot && !layout.boot_raid() {
         for d in disks {
             let dst = layout.part(d, 2);
             s.push(Step::sh(
@@ -354,6 +478,14 @@ fn repopulate_boot(layout: &Layout, disks: &[String], healthy: &str, efi: bool) 
         }
     }
     s
+}
+
+/// delete a single partition by number, for a partial (in-place) replace.
+fn sgdisk_delete(dev: &str, n: u32) -> Step {
+    Step::run_owned(
+        format!("delete partition {n} on {dev}"),
+        vec!["sgdisk".to_string(), format!("-d{n}"), dev.to_string()],
+    )
 }
 
 fn sgdisk(dev: &str, note: &str, size: &str, type_: &str) -> Step {

@@ -125,7 +125,9 @@ class Session:
 
 
 def sysbench(s: Session) -> None:
-    rc, out = s.c.run(f"bash {GUEST}/benchmark.sh", timeout=7200)
+    # the fsync-bound fileio workload now lives in the binary (`raiden benchmark`),
+    # so the harness no longer ships a script; the summary table is tailed in.
+    rc, out = s.c.run(f"{RAIDEN} benchmark", timeout=7200)
     s.report.add("sysbench", "run", INFO if rc == 0 else WARN, _tail(out, 12))
 
 

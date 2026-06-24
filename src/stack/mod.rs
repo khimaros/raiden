@@ -87,35 +87,39 @@ pub fn select(id: &str) -> Result<Box<dyn Stack>> {
     })
 }
 
-// the grub.d hook that resyncs every mirror esp from the active primary on
-// update-grub.
-pub const EFI_MIRROR_HOOK: &str = r#"#!/bin/sh
-# keep every configured esp a bootable copy of the active primary. /boot/efi is a
-# symlink to the current primary esp mount (/boot/efiN); the firmware can read
-# only a single disk's esp, so the other disks' esps are mounted noauto (by uuid)
-# in /etc/fstab and resynced here on each update-grub. re-point /boot/efi at any
-# survivor to fail over the primary. a present mirror that cannot be written is a
-# hard error; a missing disk is skipped so a degraded array does not block kernel
-# upgrades. see wiki.debian.org/UEFI
+// the grub.d hook that resyncs every mirror esp from the live primary on
+// update-grub. the primary member's esp is mounted at /boot/efi; the others have
+// no persistent mount point and are mounted transiently under /run/raiden just
+// for the rsync. baked with the member esp devices (there are no fstab entries to
+// enumerate). a present mirror that cannot be written is a hard error; a missing
+// or dead disk is skipped so a degraded array does not block kernel upgrades.
+pub fn efi_mirror_hook(esp_devices: &[String]) -> String {
+    EFI_MIRROR_HOOK_TEMPLATE.replace("@DEVS@", &esp_devices.join(" "))
+}
+
+// grub.d scripts emit grub config on stdout, so this one redirects all output to
+// stderr (it contributes no config -- it only mirrors esps as a side effect). the
+// device backing the live /boot/efi is skipped; the rest are the mirrors.
+const EFI_MIRROR_HOOK_TEMPLATE: &str = r#"#!/bin/sh
 set -u
-
-primary=$(readlink -f /boot/efi) || exit 0
-mountpoint --quiet "$primary" || exit 0
-
+exec 1>&2
+mountpoint --quiet /boot/efi || exit 0
+src=$(findmnt -no SOURCE /boot/efi) || exit 0
+mkdir -p /run/raiden
 rc=0
-while read -r spec mnt _; do
-    case "$mnt" in /boot/efi[0-9]*) ;; *) continue ;; esac
-    [ "$mnt" = "$primary" ] && continue
-    findfs "$spec" >/dev/null 2>&1 || continue
-    if mount "$mnt" && rsync --times --recursive --delete "$primary"/ "$mnt"/; then
+for dev in @DEVS@; do
+    [ -b "$dev" ] || continue
+    [ "$(readlink -f "$dev")" = "$(readlink -f "$src")" ] && continue
+    m=$(mktemp -d /run/raiden/esp.XXXXXX) || continue
+    if mount "$dev" "$m" && rsync --times --recursive --delete /boot/efi/ "$m"/; then
         :
     else
-        echo "efi: mirror $mnt ($spec) failed" >&2
+        echo "efi: mirror $dev failed"
         rc=1
     fi
-    umount "$mnt" 2>/dev/null || true
-done < /etc/fstab 1>&2
-
+    umount "$m" 2>/dev/null || true
+    rmdir "$m" 2>/dev/null || true
+done
 exit $rc
 "#;
 
@@ -125,33 +129,37 @@ exit $rc
 // run, so a grub.d hook would mirror a stale grub.cfg. instead this runs from the
 // kernel postinst.d/postrm.d hooks (which fire after zz-update-grub) and once,
 // strictly, at install. every /boot shares one fs uuid (so each disk's grub finds
-// its local copy); /boot is the live primary and the others are listed noauto in
-// fstab at /boot.mirrorN by device. --strict makes a present-but-unwritable
-// mirror a hard error; the kernel hooks pass a kernel version (not --strict) so
-// they stay best-effort and never fail a package upgrade. --one-file-system keeps
-// rsync from descending into the nested esp mounts (/boot/efiN).
-pub const BOOT_MIRROR_SYNC: &str = r#"#!/bin/sh
-set -u
+// its local copy); the copies have no persistent mount point and are mounted
+// transiently under /run/raiden by device (the shared uuid cannot address a
+// specific disk). --strict makes a present-but-unwritable mirror a hard error;
+// the kernel hooks pass a kernel version (not --strict) so they stay best-effort
+// and never fail a package upgrade. --one-file-system keeps rsync from descending
+// into the /boot/efi esp mount.
+pub fn boot_mirror_sync(boot_devices: &[String]) -> String {
+    BOOT_MIRROR_SYNC_TEMPLATE.replace("@DEVS@", &boot_devices.join(" "))
+}
 
+const BOOT_MIRROR_SYNC_TEMPLATE: &str = r#"#!/bin/sh
+set -u
 strict=0
 [ "${1:-}" = "--strict" ] && strict=1
-
 mountpoint --quiet /boot || exit 0
-
+src=$(findmnt -no SOURCE /boot) || exit 0
+mkdir -p /run/raiden
 rc=0
-while read -r spec mnt _; do
-    case "$mnt" in /boot.mirror[0-9]*) ;; *) continue ;; esac
-    [ -b "$spec" ] || continue
-    mkdir -p "$mnt"
-    if mount "$mnt" && rsync --one-file-system --times --recursive --delete /boot/ "$mnt"/; then
+for dev in @DEVS@; do
+    [ -b "$dev" ] || continue
+    [ "$(readlink -f "$dev")" = "$(readlink -f "$src")" ] && continue
+    m=$(mktemp -d /run/raiden/boot.XXXXXX) || continue
+    if mount "$dev" "$m" && rsync --one-file-system --times --recursive --delete /boot/ "$m"/; then
         :
     else
-        echo "boot: mirror $mnt ($spec) failed" >&2
+        echo "boot: mirror $dev failed" >&2
         rc=1
     fi
-    umount "$mnt" 2>/dev/null || true
-done < /etc/fstab
-
+    umount "$m" 2>/dev/null || true
+    rmdir "$m" 2>/dev/null || true
+done
 [ "$strict" = 1 ] && exit $rc
 exit 0
 "#;

@@ -78,10 +78,11 @@ def test_install_dry_run_has_key_steps(raiden):
     # before update-grub runs it. checking the exact target install line guards
     # against rsync being present only on the host.
     assert "chroot /mnt env DEBIAN_FRONTEND=noninteractive apt-get install -y grub-efi-amd64 shim-signed rsync" in out
-    # esps mount per-slot (/boot/efiN) and /boot/efi is a symlink to the primary.
-    assert "ln -sfn efi1 /mnt/boot/efi" in out
-    assert "/boot/efi1 vfat" in out  # primary, auto
-    assert "/boot/efi2 vfat" in out  # mirror, noauto
+    # the primary esp mounts directly at /boot/efi by uuid (no per-slot mounts,
+    # no symlink); the other esps are mirrors synced transiently under /run/raiden.
+    assert "/boot/efi vfat" in out
+    assert "/boot/efi1 vfat" not in out
+    assert "ln -sfn efi1 /mnt/boot/efi" not in out  # no esp slot symlink
     # default boot mode is independent: a per-disk ext4 /boot, all sharing the
     # first member's fs uuid, synced by a script run from the kernel hooks. there
     # is no md array for /boot.
@@ -89,7 +90,9 @@ def test_install_dry_run_has_key_steps(raiden):
     assert "mkfs.ext4 -m 0 -F -L boot /dev/vda2" in out
     assert "mkfs.ext4 -m 0 -F -U" in out  # the mirrors copy the primary's uuid
     assert 'echo "UUID=$uuid /boot ext4 defaults,nofail 0 2"' in out
-    assert "/boot.mirror2 ext4 noauto,nofail" in out
+    # the mirrors have no fstab entry; the sync script mounts them transiently.
+    assert "/boot.mirror" not in out
+    assert "/run/raiden" in out
     assert "/mnt/usr/local/sbin/raiden-sync-boot-mirrors" in out
     assert "/mnt/etc/kernel/postinst.d/zzz-raiden-boot-mirror" in out
     # update-grub does not run the kernel hooks, so install syncs once explicitly.
@@ -97,9 +100,52 @@ def test_install_dry_run_has_key_steps(raiden):
     # the install manifest must be written into the target so post-install ops
     # (status/scrub/replace) resolve their config without a config file.
     assert "/mnt/etc/raiden/state.toml" in out
+    # ...and the binary itself must be staged into the target, or those ops have
+    # nothing to run after reboot. copied (not apt-installed) into /usr/local/sbin.
+    assert "install -D -m 0755" in out
+    assert "/mnt/usr/local/sbin/raiden" in out
+    # staged after the rootfs exists, so the destination path is valid.
+    assert out.index("debootstrap") < out.index("/mnt/usr/local/sbin/raiden")
     # dosfstools must be installed in the TARGET (chroot): replace recreates esps
     # with mkfs.msdos on the running system, so it cannot live on the host only.
     assert "chroot /mnt env DEBIAN_FRONTEND=noninteractive apt-get install -y gdisk dosfstools mdadm" in out
+
+
+def test_benchmark_dry_run_emits_sysbench_plan(raiden):
+    # the fsync-bound fileio workload, on the root fs (not tmpfs), with the
+    # configured sizing. --dry-run prints the exact sysbench invocations (v1).
+    out = raiden("benchmark", "--dry-run").stdout
+    assert "=== phase: benchmark ===" in out
+    assert "/var/tmp/raiden-benchmark" in out
+    assert (
+        "sysbench fileio run --file-total-size=2G --file-test-mode=rndwr "
+        "--file-fsync-all=on" in out
+    )
+    assert "--file-test-mode=seqwr" in out
+    # flags override the configured sizing, and --passes controls the pass count.
+    out2 = raiden("benchmark", "--dry-run", "--size", "1G", "--passes", "1").stdout
+    assert "--file-total-size=1G" in out2
+    assert out2.count("--file-test-mode=rndwr") == 1
+
+
+def test_replace_default_rebuilds_whole_disk(raiden):
+    # no layer flags: zap and rebuild the whole disk, including the root resilver.
+    out = raiden("replace", "--disks", "vdb", "--dry-run").stdout
+    assert "sgdisk --zap-all /dev/vdb" in out
+    assert "mdadm --wait /dev/md/root" in out  # the resilver
+
+
+def test_replace_esp_boot_skips_the_root_resilver(raiden):
+    # partial: rebuild p1+p2 in place (delete+recreate, no whole-disk zap) and
+    # leave the root member alone -- no resilver, no luksFormat. this is the fast
+    # boot-recovery path (eg. after a scribbled esp/boot).
+    out = raiden("replace", "--disks", "vdb", "--esp", "--boot", "--dry-run").stdout
+    assert "sgdisk --zap-all" not in out
+    assert "delete partition 1 on /dev/vdb" in out
+    assert "delete partition 2 on /dev/vdb" in out
+    assert "delete partition 3" not in out
+    assert "mdadm --wait /dev/md/root" not in out
+    assert "luksFormat" not in out
 
 
 def _raid_boot_config(tmp_path):
@@ -145,6 +191,25 @@ def test_rescue_activates_lvm_before_mount(raiden):
     out = raiden("rescue", "--dry-run").stdout
     assert "vgchange -a y vg0" in out
     assert out.index("vgchange -a y vg0") < out.index("mount /dev/vg0/root /mnt")
+
+
+def test_mount_full_opens_and_mounts_the_stack(raiden):
+    # the full mount opens crypt, assembles, activates, and mounts root + boot/efi.
+    out = raiden("mount", "--dry-run").stdout
+    assert "=== phase: mount ===" in out
+    assert "cryptsetup luksOpen" in out
+    assert "mount /dev/vg0/root /mnt" in out
+    assert "/mnt/boot/efi" in out
+
+
+def test_mount_boot_only_skips_crypt_and_root(raiden):
+    # --boot --at / just ensures the live /boot + /boot/efi are mounted (from the
+    # first available member, idempotently) -- no crypt, no array, no password.
+    out = raiden("mount", "--boot", "--at", "/", "--dry-run").stdout
+    assert "cryptsetup luksOpen" not in out
+    assert "mount /dev/vg0/root" not in out
+    assert "mountpoint -q /boot ||" in out
+    assert "mountpoint -q /boot/efi ||" in out
 
 
 # the example config catalog, one per stack, named like raid-explorations'

@@ -26,21 +26,28 @@ it is never okay to regress on a "must not regress" requirement in a release.
   - zfs: raidz1, raidz2, raidz3
   - btrfs: raid0, raid1, raid1c2, raid1c3, raid1c4, raid5, raid6, raid10
 - R5. EFI and BIOS boot. for EFI, every disk gets an independent, bootable ESP
-  at a stable per-slot mount (/boot/efiN). /boot/efi is a symlink to the active
-  primary; the rest are noauto mirrors resynced from it by a grub.d hook on each
-  update-grub. `nofail` keeps a lost disk from blocking boot, and the primary can
-  be failed over by re-pointing the symlink.
+  (grub-install --removable plus a per-disk firmware boot entry), so the firmware
+  can boot from any survivor. the first member's ESP is mounted at /boot/efi (by
+  UUID, nofail); the others are mirrors with no persistent mount point, resynced
+  from it by a grub.d hook on each update-grub via transient mounts under
+  /run/raiden. `nofail` keeps a lost disk from blocking boot. a lost primary is
+  recovered by `raiden replace` (rebuilds it in place, preserving the ESP UUID so
+  /boot/efi returns); a surviving ESP can be mounted at /boot/efi to keep the
+  system serviceable until then.
 - R6. /boot: by default each disk carries an independent ext4 /boot, all sharing
   one fs UUID, so every disk's grub finds its own local /boot and first-disk loss
-  still boots (no array to assemble). the non-primary copies mount noauto at
-  /boot.mirrorN and are resynced from the live /boot by a script run from the
-  kernel postinst.d/postrm.d hooks (after update-grub). `boot.raid = true` instead
-  puts /boot on an md raid1 array across all member disks.
+  still boots (no array to assemble). the non-primary copies have no persistent
+  mount point; they are resynced from the live /boot by a script run from the
+  kernel postinst.d/postrm.d hooks (after update-grub) via transient mounts under
+  /run/raiden. `boot.raid = true` instead puts /boot on an md raid1 array across
+  all member disks.
 - R7. per-disk partition layout: p1 ESP (efi) or bios-boot, p2 /boot (independent
   ext4, or an md member when boot.raid), p3 root (crypt or integrity).
 - R8. crypttab and fstab reference devices by UUID so device reordering is safe
-  (the live /boot mounts by its shared UUID; only the cold /boot mirror targets
-  are addressed by device, so the sync writes each physical disk).
+  (the live /boot and the primary ESP mount by UUID). the mirror targets -- the
+  other disks' /boot and ESP copies -- are addressed by member device, since the
+  /boot copies share one UUID and the sync must write each specific disk; they are
+  mounted only transiently during the sync, never persistently.
 - R9. back up luks headers to /boot for disaster recovery.
 - R10. prompt for the encryption password once, verify it, never write it to
   disk or logs.

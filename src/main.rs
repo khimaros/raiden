@@ -1,4 +1,5 @@
-mod badblocks;
+mod bad_files;
+mod benchmark;
 mod checkpoint;
 mod cli;
 mod config;
@@ -18,7 +19,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 
 use checkpoint::Checkpoint;
-use cli::{Cli, Command, ConfigCmd, Global, InstallArgs};
+use cli::{BenchmarkArgs, Cli, Command, ConfigCmd, Global, InstallArgs, StatusArgs};
 use config::{Config, Family, Overrides};
 use layout::Layout;
 use state::State;
@@ -38,21 +39,41 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Config(ConfigCmd::Show) => cmd_config_show(g, &overrides),
+        Command::Benchmark(args) => cmd_benchmark(g, &overrides, args),
         Command::Devices => cmd_devices(g, &overrides),
-        Command::Status => cmd_status(g, &overrides),
+        Command::Status(args) => cmd_status(g, &overrides, args),
         Command::Scrub { wait: _ } => run_op(g, &overrides, "scrub", false, |c, l, s| {
             Ok(ops::scrub(c, l, s))
         }),
         Command::Rescue => run_op(g, &overrides, "rescue", false, |c, l, s| {
             Ok(ops::rescue(c, l, s))
         }),
+        Command::Mount(args) => {
+            // full mount lands at /mnt (mount_root is /mnt-relative); --boot honors
+            // --at so the running system can be fixed in place with `--at /`.
+            let boot = args.boot;
+            let at = if boot {
+                args.at.clone()
+            } else {
+                "/mnt".to_string()
+            };
+            run_op(g, &overrides, "mount", false, move |c, l, s| {
+                Ok(ops::mount(c, l, s, boot, &at))
+            })
+        }
         Command::Close => run_op(g, &overrides, "close", false, |c, l, s| {
             Ok(ops::close(c, l, s))
         }),
-        Command::Replace { disks } => {
+        Command::Replace {
+            disks,
+            esp,
+            boot,
+            root,
+        } => {
             let d = config::split_disks(disks);
+            let parts = ops::ReplaceParts::from_flags(*esp, *boot, *root);
             run_op(g, &overrides, "replace", true, move |c, l, s| {
-                ops::replace(c, l, s, &d)
+                ops::replace(c, l, s, &d, &parts)
             })
         }
         Command::Remove { disks } => {
@@ -113,8 +134,12 @@ fn cmd_install(g: &Global, overrides: &Overrides, args: &InstallArgs) -> Result<
         || std::env::var("RAIDEN_PASSWORD")
             .map(|v| !v.is_empty())
             .unwrap_or(false);
+    // the running binary is copied into the target so post-install ops work after
+    // reboot; if its path cannot be resolved, the copy step is simply omitted.
+    let exe = std::env::current_exe().ok();
+    let raiden_bin = exe.as_deref().and_then(Path::to_str);
     let plan = filter_phases(
-        pipeline::install(&cfg, &layout, stack.as_ref(), auto_root),
+        pipeline::install(&cfg, &layout, stack.as_ref(), auto_root, raiden_bin),
         &args.from,
         &args.only,
     )?;
@@ -264,9 +289,20 @@ fn guard(op: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(g: &Global, overrides: &Overrides) -> Result<()> {
+fn cmd_status(g: &Global, overrides: &Overrides, args: &StatusArgs) -> Result<()> {
     let cfg = resolve_config(g, overrides)?;
     cfg.validate()?;
+    let is_md = matches!(cfg.family()?, Family::Md);
+    // --bad-files narrows status to just the affected-file listing. it is the
+    // read-error mapping alone (md stacks only), with none of the array detail.
+    if args.bad_files {
+        if is_md {
+            bad_files::report();
+        } else {
+            println!("bad-files mapping applies only to md stacks");
+        }
+        return Ok(());
+    }
     let layout = Layout::derive(&cfg);
     let stack = stack::select(&cfg.raid.stack)?;
     let plan = vec![Phase::new(
@@ -279,10 +315,35 @@ fn cmd_status(g: &Global, overrides: &Overrides) -> Result<()> {
     }
     // status is read-only; its steps are best-effort and write no checkpoint.
     step::execute_plan(&plan, None, (0, 0), g.verbose, |_, _, _| Ok(()))?;
-    if matches!(cfg.family()?, Family::Md) {
-        badblocks::report();
+    if is_md {
+        bad_files::report();
     }
     Ok(())
+}
+
+/// run (or, with --dry-run, print) the fsync-bound fileio benchmark on the array.
+/// resolves the benchmark sizing from the manifest/config, overlaid by flags.
+fn cmd_benchmark(g: &Global, overrides: &Overrides, args: &BenchmarkArgs) -> Result<()> {
+    let cfg = resolve_config(g, overrides)?;
+    cfg.validate()?;
+    let mut b = benchmark::Bench::from_cfg(&cfg.benchmark);
+    if let Some(v) = &args.size {
+        b.size = v.clone();
+    }
+    if let Some(v) = args.passes {
+        b.passes = v;
+    }
+    if let Some(v) = args.rndwr_events {
+        b.rndwr_events = v;
+    }
+    if let Some(v) = args.seqwr_events {
+        b.seqwr_events = v;
+    }
+    if g.dry_run {
+        step::print_plan(&benchmark::plan(&b));
+        return Ok(());
+    }
+    benchmark::run(&b, &args.format)
 }
 
 fn cmd_config_show(g: &Global, overrides: &Overrides) -> Result<()> {
@@ -298,14 +359,13 @@ fn cmd_config_show(g: &Global, overrides: &Overrides) -> Result<()> {
     if layout.boot_raid() {
         println!("boot mode:    md raid1 ({})", layout::BOOT_MD_DEVICE);
     } else {
-        println!("boot mode:    independent");
-        println!("boot mounts:  {}", layout.boot_mounts().join(", "));
+        println!(
+            "boot mode:    independent (live /boot by shared uuid; mirrors synced transiently)"
+        );
     }
-    println!("esp mounts:   {}", layout.esp_mounts().join(", "));
     println!(
-        "esp link:     {} -> {}",
-        layout::ESP_LINK,
-        layout.esp_primary()
+        "esp mount:    {} (primary esp; other esps synced transiently)",
+        layout::ESP_MOUNT
     );
     println!("crypt names:  {}", layout.crypt_names().join(", "));
     println!("manifest:     {} (written at install)", state::DEFAULT_PATH);

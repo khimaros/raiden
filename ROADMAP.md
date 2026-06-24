@@ -317,6 +317,49 @@
     confirmation, so a typo no longer kills a long install. the root password is
     set by the system `passwd` in the chroot, which already re-prompts on mismatch.
 
+[x] install the raiden binary into the target during finish, so post-install ops
+    (status/scrub/replace/remove/close/rescue) work after reboot -- previously
+    only the manifest was staged, leaving the tool that reads it absent. copies
+    the running (static musl) binary to /usr/local/sbin/raiden; a dynamically
+    linked dev build copied there may not run, but real installs use the musl one.
+
+[x] `raiden benchmark`: port the harness's guest/benchmark.sh fsync-bound sysbench
+    fileio workload into the binary. a `[benchmark]` config section (size, passes,
+    rndwr/seqwr events) with flag overrides; `--dry-run` prints the exact sysbench
+    plan (v1); a real run captures + parses each pass and prints a per-mode summary
+    (avg total + avg p95), or `--format json` (v2). the vm harness scenario calls
+    `raiden benchmark` instead of shipping the script, which is deleted.
+
+[x] rename the badblocks module to bad_files and expose `status --bad-files`,
+    which narrows status to just the unrecoverable-read-error file listing (md
+    stacks). the full `status` still runs it after the array detail as before.
+
+[x] option a boot/esp layout: drop the per-slot esp mounts (/boot/efiN), the
+    /boot/efi symlink, and the /boot.mirrorN fstab entries. the primary member's
+    esp mounts directly at /boot/efi (by uuid); every other esp and /boot copy is
+    a mirror with no persistent mount point, resynced via transient mounts under
+    /run/raiden by member-driven hooks (baked device list, not fstab). replace
+    preserves only the primary esp uuid; mirrors get fresh uuids, re-populated by
+    the hook. declutters / and /boot; recovery is via replace (rebuild in place).
+    R5/R6/R8 reworded to match without regressing first-disk-loss survivability.
+
+[x] replace --esp/--boot/--root (default all): rebuild only the named per-disk
+    layers. a partial replace recreates just those partitions in place (no
+    whole-disk zap) and leaves the others untouched -- so --esp --boot recovers a
+    scribbled boot region without touching the root member (no resilver).
+[x] `raiden mount [--boot] [--at DIR]`: ensure the stack is open + mounted
+    (idempotent, guarded). full form opens crypt/assembles/activates/mounts under
+    /mnt; --boot just mounts /boot + /boot/efi from the first available member at
+    DIR (default /mnt; --at / for the running system). the boot-mount logic is
+    shared (pipeline::boot_mount_steps) by install's bind, rescue, and mount, so
+    all three tolerate a missing primary esp.
+
+[x] migrate-boot-layout.sh: in-place migration of an existing old-layout install
+    (per-slot /boot/efiN + symlink + /boot.mirrorN fstab) to option a. rewrites
+    fstab to the single /boot/efi-by-uuid entry, remounts the primary esp there,
+    installs the new member-driven mirror hooks, and resyncs. dry-run by default
+    (APPLY=1 to apply); backs up fstab; idempotent.
+
 [ ] run the vm harness against all four stacks on a kvm host and commit
     a result-YYYY-MM.md per stack (needs a libvirt host)
 [ ] rescue boot: instrument the efi boot manager via send-key to select the

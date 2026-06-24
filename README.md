@@ -101,18 +101,36 @@ raiden install --dry-run        # print every command without running it
 raiden install --from mount     # resume from a phase
 raiden install --only partition # run a single phase
 raiden install --list-phases
-raiden replace --disks vdb,vdc  # rebuild specific disks
+raiden replace --disks vdb,vdc       # rebuild whole disks
+raiden replace --disks vdb --esp --boot  # rebuild just the boot region (no resilver)
 ```
 
 operations (post-install or from a livecd):
 
 ```
 raiden status                   # array health + read-errors mapped to files
+raiden status --bad-files       # only the files hit by unrecoverable read errors
 raiden scrub --wait
-raiden rescue                   # assemble + unlock + mount
+raiden rescue                   # assemble + unlock + mount (livecd -> chroot)
+raiden mount                    # ensure the stack is open + mounted (idempotent)
+raiden mount --boot --at /      # just (re)mount /boot + /boot/efi on a live system
 raiden close                    # unmount, stop arrays, lock crypt
 raiden remove --disks vdb
+raiden benchmark                 # fsync-bound fileio benchmark on the array
 ```
+
+`raiden replace` rebuilds whole disks by default; naming layers (`--esp`, `--boot`,
+`--root`) rebuilds only those -- `--esp --boot` recovers a scribbled boot region
+without touching the root member, skipping the slow resilver. `raiden mount` brings
+the stack up from the first available member (the primary ESP mounts at `/boot/efi`;
+mirrors are synced transiently), so a lost-primary system stays serviceable until a
+`replace`.
+
+`raiden benchmark` runs the durable-write (`sysbench fileio`, `--file-fsync-all`)
+workload on the root fs and prints a per-mode summary (`--format json` for tooling);
+`--dry-run` prints the exact sysbench commands. tune it with the `[benchmark]`
+config keys (`size`, `passes`, `rndwr_events`, `seqwr_events`) or the matching
+flags.
 
 introspection:
 
@@ -163,7 +181,9 @@ applies only in that mode).
 after install, the resolved truth (stack, level, members, and the chosen
 partition/luks/esp UUIDs) is written to `/etc/raiden/state.toml` and mirrored to
 /boot. post-install operations read this manifest, so they do not need a config
-that matches install time.
+that matches install time. install also copies the `raiden` binary itself to
+`/usr/local/sbin/raiden` in the target, so `status`/`scrub`/`replace`/`remove`/
+`close` are available on the booted system without re-fetching it.
 
 ## unattended use and resume
 

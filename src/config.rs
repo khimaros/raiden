@@ -48,6 +48,7 @@ pub struct Config {
     pub integrity: Integrity,
     pub btrfs: Btrfs,
     pub boot: Boot,
+    pub benchmark: Benchmark,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -100,6 +101,18 @@ pub struct Integrity {
 #[serde(default, deny_unknown_fields)]
 pub struct Btrfs {
     pub csum: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Benchmark {
+    // sysbench fileio working-set size, passes per mode, and per-mode event counts.
+    // random writes churn more per event, so they converge in fewer events. these
+    // defaults restore raid-explorations' pre-regression sizing (stable p95).
+    pub size: String,
+    pub passes: u32,
+    pub rndwr_events: u64,
+    pub seqwr_events: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -172,6 +185,17 @@ impl Default for Boot {
             raid: false,
             level: 1,
             bitmap: "internal".into(),
+        }
+    }
+}
+
+impl Default for Benchmark {
+    fn default() -> Self {
+        Self {
+            size: "2G".into(),
+            passes: 3,
+            rndwr_events: 5000,
+            seqwr_events: 20000,
         }
     }
 }
@@ -282,6 +306,13 @@ impl Config {
                 self.raid.level,
                 valid.join(", ")
             );
+        }
+
+        if self.benchmark.passes == 0 {
+            bail!("benchmark.passes must be at least 1");
+        }
+        if self.benchmark.rndwr_events == 0 || self.benchmark.seqwr_events == 0 {
+            bail!("benchmark.rndwr_events and benchmark.seqwr_events must be non-zero");
         }
         Ok(())
     }

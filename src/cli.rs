@@ -59,14 +59,23 @@ pub enum Command {
     Init(InitArgs),
     /// run the full install pipeline
     Install(InstallArgs),
-    /// rebuild specific disks
+    /// rebuild specific disks (all layers by default, or only those named)
     Replace {
         /// comma-separated disks to rebuild
         #[arg(long)]
         disks: String,
+        /// rebuild the esp (p1) only [default: all layers]
+        #[arg(long)]
+        esp: bool,
+        /// rebuild /boot (p2) only
+        #[arg(long)]
+        boot: bool,
+        /// rebuild the root member (p3) only -- includes the array resilver
+        #[arg(long)]
+        root: bool,
     },
     /// array health and read-error mapping
-    Status,
+    Status(StatusArgs),
     /// start or check a scrub
     Scrub {
         /// wait for the scrub to finish
@@ -75,6 +84,8 @@ pub enum Command {
     },
     /// assemble, unlock, and mount from a livecd
     Rescue,
+    /// ensure the stack is open and mounted (or just /boot + /boot/efi with --boot)
+    Mount(MountArgs),
     /// unmount, stop arrays, lock crypt
     Close,
     /// detach disks from the array
@@ -83,11 +94,49 @@ pub enum Command {
         #[arg(long)]
         disks: String,
     },
+    /// run the fsync-bound fileio benchmark on the array
+    Benchmark(BenchmarkArgs),
     /// inspect configuration
     #[command(subcommand)]
     Config(ConfigCmd),
     /// list candidate disks and array members
     Devices,
+}
+
+#[derive(Args)]
+pub struct MountArgs {
+    /// mount only /boot and /boot/efi (no crypt/array, no password)
+    #[arg(long)]
+    pub boot: bool,
+    /// directory to mount under (default /mnt); use / for the running system
+    #[arg(long, default_value = "/mnt")]
+    pub at: String,
+}
+
+#[derive(Args)]
+pub struct StatusArgs {
+    /// show only the files affected by unrecoverable read errors (md stacks)
+    #[arg(long)]
+    pub bad_files: bool,
+}
+
+#[derive(Args)]
+pub struct BenchmarkArgs {
+    /// working-set size (sysbench --file-total-size), eg. 2G
+    #[arg(long)]
+    pub size: Option<String>,
+    /// passes per write mode
+    #[arg(long)]
+    pub passes: Option<u32>,
+    /// random-write events per pass
+    #[arg(long)]
+    pub rndwr_events: Option<u64>,
+    /// sequential-write events per pass
+    #[arg(long)]
+    pub seqwr_events: Option<u64>,
+    /// output format: "text" (default) or "json"
+    #[arg(long, default_value = "text")]
+    pub format: String,
 }
 
 #[derive(Args)]
