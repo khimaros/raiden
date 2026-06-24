@@ -293,19 +293,21 @@ pub fn execute_plan(
     verbose: bool,
     mut on_done: impl FnMut(usize, usize, &str) -> Result<()>,
 ) -> Result<()> {
+    // progress/narration goes to stderr so stdout carries only a command's own
+    // output (and machine-readable results like `benchmark --format json`).
     for (pi, phase) in plan.iter().enumerate() {
-        println!(">>> phase: {}", phase.name);
+        eprintln!(">>> phase: {}", phase.name);
         for (si, step) in phase.steps.iter().enumerate() {
             if pi < start.0 || (pi == start.0 && si < start.1) {
-                println!("  - {} (already done, skipping)", step.note);
+                eprintln!("  - {} (already done, skipping)", step.note);
                 continue;
             }
-            println!("  - {}", step.note);
+            eprintln!("  - {}", step.note);
             // in verbose mode echo the exact command (password masked); the
             // command's own stdout/stderr already stream to the console.
             if verbose {
                 for line in step.describe() {
-                    println!("    {line}");
+                    eprintln!("    {line}");
                 }
             }
             step.execute(password)?;

@@ -232,7 +232,7 @@ fn run_plan(op: &str, plan: &[Phase], cfg: &Config, g: &Global) -> Result<()> {
     match result {
         Ok(()) => {
             Checkpoint::clear(path);
-            println!("\n{op} complete");
+            eprintln!("\n{op} complete");
             Ok(())
         }
         Err(e) => {
@@ -258,7 +258,7 @@ fn resume_start(op: &str, hash: &str, resume: bool, path: &Path) -> Result<(usiz
     if cp.config_hash != hash {
         bail!("config changed since the checkpoint; cannot resume safely");
     }
-    println!(
+    eprintln!(
         "resuming {op} after phase {:?}, step {} (already-applied steps are skipped)",
         cp.phase_name, cp.step
     );
@@ -343,7 +343,7 @@ fn cmd_benchmark(g: &Global, overrides: &Overrides, args: &BenchmarkArgs) -> Res
         step::print_plan(&benchmark::plan(&b));
         return Ok(());
     }
-    benchmark::run(&b, &args.format)
+    benchmark::run(&b, &args.format, g.verbose)
 }
 
 fn cmd_config_show(g: &Global, overrides: &Overrides) -> Result<()> {

@@ -95,15 +95,29 @@ pub fn plan(b: &Bench) -> Vec<Phase> {
 
 /// run the benchmark for real: prepare, run every pass capturing its output,
 /// parse the durable-write metrics, and print a per-mode summary (or json).
-pub fn run(b: &Bench, format: &str) -> Result<()> {
+/// progress is narrated phase by phase on stderr (and the exact command with
+/// `verbose`), since this op captures output rather than streaming it, so stdout
+/// stays the clean result -- the summary table or the json.
+pub fn run(b: &Bench, format: &str, verbose: bool) -> Result<()> {
     let json = match format {
         "text" | "json" => format == "json",
         other => bail!("--format must be \"text\" or \"json\", got {other:?}"),
     };
+    eprintln!(
+        "benchmark: sysbench fileio (fsync-all), {} working set, {} passes per mode",
+        b.size, b.passes
+    );
     // best-effort: sysbench is usually preinstalled (the harness adds it as a
     // package); install it if missing, but let a later failure report the cause.
     let _ = run_argv(&["apt-get", "install", "-y", "sysbench"]);
     run_argv(&["mkdir", "-p", WORKDIR])?;
+    eprintln!(
+        "benchmark: preparing the {} working set in {WORKDIR} (may take a while)...",
+        b.size
+    );
+    if verbose {
+        eprintln!("  + {}", b.prepare_cmd());
+    }
     shell(&b.prepare_cmd()).context("preparing the fileio working set")?;
 
     let mut results = Vec::new();
@@ -111,18 +125,20 @@ pub fn run(b: &Bench, format: &str) -> Result<()> {
         let mut totals = Vec::new();
         let mut p95s = Vec::new();
         for i in 1..=b.passes {
+            eprintln!(
+                "benchmark: {mode} pass {i}/{} ({events} events)...",
+                b.passes
+            );
+            if verbose {
+                eprintln!("  + {}", b.run_cmd(mode, events));
+            }
             let out = shell(&b.run_cmd(mode, events))
                 .with_context(|| format!("running sysbench {mode} pass {i}"))?;
             let (total, p95) = parse_pass(&out)
                 .with_context(|| format!("parsing sysbench {mode} pass {i} output"))?;
             totals.push(total);
             p95s.push(p95);
-            if !json {
-                println!(
-                    "  {mode} pass {i}/{}: total {total:.1}s  p95 {p95:.1}ms",
-                    b.passes
-                );
-            }
+            eprintln!("benchmark:   -> total {total:.1}s  p95 {p95:.1}ms");
         }
         results.push(ModeResult {
             mode,
@@ -207,11 +223,15 @@ fn shell(cmd: &str) -> Result<String> {
 }
 
 fn run_argv(argv: &[&str]) -> Result<()> {
-    let status = Command::new(argv[0])
+    // capture and re-emit on stderr so a child's chatter (eg. apt-get) never lands
+    // on stdout, which carries the clean result (the summary table or the json).
+    let out = Command::new(argv[0])
         .args(&argv[1..])
-        .status()
+        .output()
         .with_context(|| format!("running {}", argv.join(" ")))?;
-    if !status.success() {
+    eprint!("{}", String::from_utf8_lossy(&out.stdout));
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
         bail!("command failed: {}", argv.join(" "));
     }
     Ok(())
