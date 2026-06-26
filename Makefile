@@ -1,7 +1,10 @@
-.PHONY: build dist precommit test test-e2e test-vm-unit test-vm test-vm-install test-vm-boot analysis fmt clippy clean
+.PHONY: build release dist precommit test test-e2e test-vm-unit test-vm test-vm-install test-vm-boot analysis fmt clippy clean
 
 build:
 	cargo build
+
+release:
+	cargo build --release
 
 # fully static x86_64 binary for a live environment: no toolchain or shared libs
 # needed on the target, so a bare Debian live can `wget` it and run (see
@@ -34,14 +37,14 @@ test-vm-unit:
 # the graded report is written to a timestamped file under tests/vm/reports/ so
 # every run is kept; OUT=<path> overrides it. optional: STACK=<stack> (installs
 # the matching examples/ config), CONFIG=<path> (a specific config instead),
-# SCENARIO=<name[,name]> (subset; see --list-scenarios), SKIP_BENCH=1 (drop the
-# costly sysbench pass; for fast correctness/troubleshooting runs), TAG=<label>
+# SCENARIO=<name[,name]> (subset; see --list-scenarios), BENCH=1 (add the costly
+# sysbench pass for a perf report; off by default), TAG=<label>
 # (folded into the report filename, eg. to tell same-stack levels apart like
 # raid6 vs raid10), BOOT_RAID=1 (md raid1 /boot instead of the default independent
 # /boot), KEEP=1 (leave the vm + disks + console.log for inspection).
 test-vm:
 	cargo build --release
-	cd tests/vm && uv run python -m raiden_e2e.run --iso "$(ISO)" --stack "$(or $(STACK),dm-crypt~md~lvm~ext4)" $(if $(CONFIG),--config "$(CONFIG)") $(if $(SCENARIO),--scenario "$(SCENARIO)") $(if $(SKIP_BENCH),--skip-benchmark) $(if $(TAG),--tag "$(TAG)") $(if $(BOOT_RAID),--boot-raid) $(if $(KEEP),--keep) $(if $(OUT),--out "$(OUT)")
+	cd tests/vm && uv run python -m raiden_e2e.run --iso "$(ISO)" --stack "$(or $(STACK),dm-crypt~md~lvm~ext4)" $(if $(CONFIG),--config "$(CONFIG)") $(if $(SCENARIO),--scenario "$(SCENARIO)") $(if $(BENCH),--benchmark) $(if $(TAG),--tag "$(TAG)") $(if $(BOOT_RAID),--boot-raid) $(if $(KEEP),--keep) $(if $(OUT),--out "$(OUT)")
 
 # fast live/install check: boot the livecd, run the install (through livecd.sh, as
 # on real hardware), and stop before the post-install scenarios. ISO=<debian live>;

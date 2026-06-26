@@ -9,6 +9,10 @@ use crate::config::{Config, STACK_MD_LVM_EXT4, STACK_MD_LVM_XFS};
 use crate::layout::{Layout, ROOT_MD_DEVICE, ROOT_MD_NAME};
 use crate::step::Step;
 
+// crypttab options for this stack's per-disk members. shared between the install
+// write and the running-system regen (replace --with) so the two cannot drift.
+const CRYPTTAB_OPTS: &str = "luks,initramfs,keyscript=decrypt_keyctl";
+
 #[derive(Clone, Copy)]
 pub enum RootFs {
     Ext4,
@@ -73,9 +77,9 @@ impl Stack for MdLvm {
     fn finish(&self, _cfg: &Config, layout: &Layout) -> Vec<Step> {
         let mut s = vec![
             super::install_keyutils(),
-            super::crypttab_step(layout, "luks,initramfs,keyscript=decrypt_keyctl"),
+            super::crypttab_step(layout, CRYPTTAB_OPTS, "/mnt/etc/crypttab"),
         ];
-        s.extend(super::backup_luks_headers(layout));
+        s.extend(super::backup_luks_headers(layout, "/mnt/boot"));
         s.push(match self.fs {
             RootFs::Ext4 => super::fstab_root_ext4(),
             RootFs::Xfs => super::fstab_root_xfs(),
@@ -125,6 +129,25 @@ impl Stack for MdLvm {
                 .best_effort()
             },
         )
+    }
+
+    fn crypttab_regen(&self, layout: &Layout) -> Option<Step> {
+        Some(super::crypttab_step(layout, CRYPTTAB_OPTS, "/etc/crypttab"))
+    }
+
+    fn initramfs_binaries(&self) -> Vec<&'static str> {
+        let mut b = super::crypt_initramfs_binaries();
+        b.extend(["mdadm", "lvm"]);
+        b
+    }
+
+    fn recover_actions(
+        &self,
+        _cfg: &Config,
+        _layout: &Layout,
+        at: &str,
+    ) -> Vec<super::RecoverAction> {
+        super::md_recover_actions(at)
     }
 
     fn close(&self, _cfg: &Config, layout: &Layout) -> Vec<Step> {

@@ -101,8 +101,13 @@ defaults are small.
 2. in-place scenarios, each recovered before the next: bitrot within redundancy,
    header damage, and whole-disk truncation -- graded for detect / survive /
    reboot / clean.
-3. 4/4 corruption + `raiden rescue` from the livecd.
-4. boot/esp destruction (`corrupt_efiboot`), run separately on a fresh install
+3. health + repair: `raiden doctor` passes on the healthy system; `sync_mirrors`
+   re-syncs the /boot + esp mirrors and repairs a corrupted one; `doctor_fix`
+   exercises `doctor --fix` end to end -- reinstalls a removed kernel hook, and
+   detects/declines/re-stamps a mirror esp whose fs uuid was skewed off the shared
+   one (the legacy-host esp-uuid migration; `--yes` accepts, no-flag declines).
+4. 4/4 corruption + `raiden rescue` from the livecd.
+5. boot/esp destruction (`corrupt_efiboot`), run separately on a fresh install
    (`make test-vm-boot`) so its boot result is not confounded by the above.
 
 ## fast tests

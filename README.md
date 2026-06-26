@@ -101,8 +101,9 @@ raiden install --dry-run        # print every command without running it
 raiden install --from mount     # resume from a phase
 raiden install --only partition # run a single phase
 raiden install --list-phases
-raiden replace --disks vdb,vdc       # rebuild whole disks
+raiden replace --disks vdb,vdc       # rebuild whole disks (in place)
 raiden replace --disks vdb --esp --boot  # rebuild just the boot region (no resilver)
+raiden replace --disks vdb --with sde    # physical swap: vdb out, sde in
 ```
 
 operations (post-install or from a livecd):
@@ -112,19 +113,50 @@ raiden status                   # array health + read-errors mapped to files
 raiden status --bad-files       # only the files hit by unrecoverable read errors
 raiden scrub --wait
 raiden rescue                   # assemble + unlock + mount (livecd -> chroot)
+raiden recover                  # bring a degraded root online from the initramfs
 raiden mount                    # ensure the stack is open + mounted (idempotent)
 raiden mount --boot --at /      # just (re)mount /boot + /boot/efi on a live system
 raiden close                    # unmount, stop arrays, lock crypt
 raiden remove --disks vdb
+raiden sync boot                # resync the independent /boot mirrors from the live primary
+raiden sync efi                 # resync the esp mirrors from the live /boot/efi (efi mode)
 raiden benchmark                 # fsync-bound fileio benchmark on the array
 ```
 
 `raiden replace` rebuilds whole disks by default; naming layers (`--esp`, `--boot`,
 `--root`) rebuilds only those -- `--esp --boot` recovers a scribbled boot region
-without touching the root member, skipping the slow resilver. `raiden mount` brings
+without touching the root member, skipping the slow resilver. `raiden replace
+--disks=a --with=c` physically swaps disk `a` for a new disk `c` (paired by
+position): the old disk is detached best-effort (it may be gone) and never wiped,
+the new disk is wiped + provisioned + re-added, and the manifest's member list is
+mutated (`a`->`c`). the new disk adopts the old disk's esp/luks identity (the
+shared esp uuid, the shared /boot uuid) so fstab stays valid; crypttab is
+regenerated for the new crypt names. `--with` is optional -- without it, replace
+is the in-place rebuild. `raiden mount` brings
 the stack up from the first available member (the primary ESP mounts at `/boot/efi`;
 mirrors are synced transiently), so a lost-primary system stays serviceable until a
 `replace`.
+
+`raiden recover` brings a degraded root online from the initramfs rescue shell so
+the boot can continue, generalizing the per-stack manual `mount -o degraded`
+commands into one command (btrfs/bcachefs refuse a multi-device mount with a faulty
+member; md/zfs assemble degraded on their own, so it is a no-op there). raiden and
+the manifest are baked into the initrd at install (`install.initramfs_recovery`,
+default on), so the command is available at the rescue shell; run `raiden recover`
+there, then `exit` to resume booting. it is check/fix like `doctor`: it mounts the
+root only if it is not already mounted, and confirms each action unless `--yes`.
+
+`raiden sync boot` and `raiden sync efi` resync the independent `/boot` and esp
+mirrors from the live primary (the default, non-raid `/boot`). both verify the
+source first (boot: read-only fsck, grub.cfg/kernel/initrd presence, initrd
+contains cryptsetup; efi: shimx64/grubx64 present) and bail without syncing on a
+verify failure, so a broken source is never propagated; `--force` skips verify
+(used by no script). they prompt unless `--yes`. `sync boot` is a no-op when
+`boot.raid` is set (mdadm handles replication). the kernel `postinst.d`/`postrm.d`
+hooks call `sync boot` automatically after each kernel update, and the `grub.d`
+hook calls `sync efi` on each `update-grub`; you only run them by hand to force a
+resync. the two are separate because /boot must sync after `zz-update-grub`
+(needs the final grub.cfg), while the esp syncs during `update-grub`.
 
 `raiden benchmark` runs the durable-write (`sysbench fileio`, `--file-fsync-all`)
 workload on the root fs and prints a per-mode summary (`--format json` for tooling);
@@ -132,12 +164,54 @@ workload on the root fs and prints a per-mode summary (`--format json` for tooli
 config keys (`size`, `passes`, `rndwr_events`, `seqwr_events`) or the matching
 flags.
 
+`raiden doctor` walks the installed system and reports the health of each layer
+the manifest says should be present: disk presence, /boot + /boot/efi mounts
+(and a note when they sit on different disks -- expected, since both mount by
+a shared fs uuid),
+fstab + crypttab, luks headers, array status (md/zfs/btrfs), boot + esp mirror
+presence AND drift (a present-but-never-synced mirror is a silent failure),
+grub install, initrd (that it carries the boot/recovery binaries -- decrypt_keyctl
++ keyctl, cryptsetup, and the stack's assemble/mount tools; and, when
+`install.initramfs_recovery` is on, that raiden + the manifest are baked in for
+`raiden recover`), the boot-mirror kernel
+hooks AND the esp-mirror grub.d hook (both checked for presence AND the
+executable bit, since run-parts and grub-mkconfig silently skip non-executable
+scripts), and the manifest itself. it runs every check best-effort (a dead disk
+fails its own check but the rest still run), and exits non-zero if any check
+fails. `--verbose` shows full detail lines.
+
+`raiden doctor --fix` repairs the auto-fixable checks in place: it installs the
+boot-mirror kernel hooks (`postinst.d`/`postrm.d`/`zzz-raiden-boot-mirror`), the
+esp-mirror grub.d hook (`90_copy_to_efi_mirrors`), and the raiden recovery hook
+(`/etc/initramfs-tools/hooks/raiden`, then rebuilds the initrd so it carries raiden
++ the manifest for `raiden recover` -- a plain rebuild cannot add them when the hook
+is absent, eg. on a legacy install) when missing or
+non-executable, re-runs `raiden sync boot`/`sync efi` to repair drifted mirrors,
+and re-stamps any mirror whose fs uuid diverges from the shared one so it can
+serve `/boot` or `/boot/efi` if the primary is lost. the re-stamp re-observes
+live state (it propagates the mounted source's uuid, never touches the source,
+and skips already-shared mirrors); `/boot` is changed in place (`tune2fs`), an
+esp is reformatted with the shared volume id then repopulated by the sync. this
+doubles as the one-shot migration for a legacy host installed before the shared
+esp uuid: `raiden doctor --fix` brings it up to spec. each fix is confirmed
+individually before it runs (`--yes` auto-accepts them all, for unattended use);
+a declined fix is left in place and noted. `raiden doctor --fix --dry-run` prints
+the fix flow instead of the checks table -- each fixable check followed by the
+exact commands it would run, in order (the `mkfs.msdos -i ...` per mirror, then the
+re-sync) -- and changes nothing. a look-before-you-leap for the destructive
+re-stamp, before running it on hardware. each applied fix is reported as a
+`fixed` status row. drift and uuid divergence are warns (the system still boots
+from the primary); destructive checks (fstab, crypttab, luks, array state,
+grub-install) are never auto-fixed.
+
 introspection:
 
 ```
 raiden config show              # resolved config + derived layout
 raiden config validate          # check config without touching disks
 raiden devices                  # candidate disks and array members
+raiden doctor                   # installed-system health checks
+raiden doctor --fix             # repair missing hooks + drifted mirrors
 ```
 
 global flags include `--config <path>`, `--dry-run`, `--yes`, `--resume`,
@@ -179,9 +253,11 @@ assemble. the copies are kept in sync automatically on kernel changes. set
 applies only in that mode).
 
 after install, the resolved truth (stack, level, members, and the chosen
-partition/luks/esp UUIDs) is written to `/etc/raiden/state.toml` and mirrored to
-/boot. post-install operations read this manifest, so they do not need a config
-that matches install time. install also copies the `raiden` binary itself to
+partition/luks/esp UUIDs) is written to `/boot/raiden/manifest.toml` (canonical)
+and mirrored to `/etc/raiden/manifest.toml`. /boot is canonical so a livecd can
+read it by mounting a member's /boot without unlocking the root fs. post-install
+operations read this manifest, so they do not need a config that matches install
+time. install also copies the `raiden` binary itself to
 `/usr/local/sbin/raiden` in the target, so `status`/`scrub`/`replace`/`remove`/
 `close` are available on the booted system without re-fetching it.
 
@@ -206,19 +282,27 @@ set `serial_console = true` (under `[install]`) to enable a serial console on th
 installed system -- handy for headless servers and used by the automated test
 harness.
 
+`install.initramfs_recovery` (default on) bakes the raiden binary + the manifest
+into the initrd so `raiden recover` is available at the rescue shell to bring a
+degraded root online; set it to `false` to keep the initrd minimal (the
+per-stack manual `mount -o degraded` is then the fallback).
+
 ## testing
 
 ```
 make test-e2e        # fast: planning, validation, resume (no vm)
 make test-vm-unit    # vm harness logic (no vm)
-make test-vm ISO=/path/to/debian-live.iso              # full libvirt vm run
+make test-vm ISO=/path/to/debian-live.iso              # libvirt vm run (resilience only)
 make test-vm ISO=... STACK=dm-crypt~zfs                # a specific stack's example
 make test-vm ISO=... CONFIG=examples/dm-crypt~btrfs.raid1c3.toml   # a specific config
+make test-vm ISO=... BENCH=1                            # add the sysbench benchmark (off by default)
 ```
 
 the vm harness drives a real install and the corruption/repair scenarios in a
 libvirt/kvm vm over the serial console, fully automated, and writes a graded
-report (with its full run log saved alongside). it installs the matching
+report (with its full run log saved alongside). the fsync-bound sysbench
+benchmark is off by default (it is ~26min and orthogonal to correctness); add it
+with `BENCH=1` for a performance report. it installs the matching
 `examples/` config for the stack (or `CONFIG=<path>`), overlaying only the
 test-specific keys (serial console, member disks, /boot mode). graded reports and
 logs land in [tests/vm/reports/](tests/vm/reports/); see

@@ -74,23 +74,9 @@ pub fn generate(flags: &Overrides, boot_mode: Option<&str>, interactive: bool) -
     if members.is_empty() {
         bail!("no member disks chosen; pass --members or run where disks are visible");
     }
-    let (prefix, mixed) = resolve_prefix(&members);
-    if mixed {
-        eprintln!(
-            "warning: members mix partition-naming styles (eg. nvme vs sd); raiden uses one\n  \
-             part_prefix for all members. prefer disks of one type, or fix disks.part_prefix."
-        );
-    }
     let level = resolve_level(o.level.as_deref(), family, members.len(), interactive)?;
     let boot = resolve_boot_mode(boot_mode, interactive)?;
-    let cfg = assemble(
-        &stack,
-        &level,
-        &members,
-        prefix,
-        &boot,
-        o.release.as_deref(),
-    );
+    let cfg = assemble(&stack, &level, &members, &boot, o.release.as_deref());
     cfg.validate()
         .context("the chosen options do not form a valid config")?;
     Ok(cfg)
@@ -184,22 +170,6 @@ fn parse_selection(ans: &str, disks: &[Disk]) -> Vec<String> {
     out
 }
 
-fn resolve_prefix(members: &[String]) -> (String, bool) {
-    let first = part_prefix(&members[0]);
-    let mixed = members.iter().any(|m| part_prefix(m) != first);
-    (first.to_string(), mixed)
-}
-
-/// the kernel partition separator for a whole-disk name: "p" when the name ends
-/// in a digit (nvme0n1 -> nvme0n1p1, mmcblk0 -> mmcblk0p1), empty otherwise
-/// (sda -> sda1, vda -> vda1).
-fn part_prefix(name: &str) -> &'static str {
-    match name.chars().last() {
-        Some(c) if c.is_ascii_digit() => "p",
-        _ => "",
-    }
-}
-
 fn resolve_level(
     flag: Option<&str>,
     family: Family,
@@ -276,7 +246,6 @@ fn assemble(
     stack: &str,
     level: &str,
     members: &[String],
-    prefix: String,
     boot_mode: &str,
     release: Option<&str>,
 ) -> Config {
@@ -284,7 +253,6 @@ fn assemble(
     c.raid.stack = stack.to_string();
     c.raid.level = level.to_string();
     c.disks.members = members.to_vec();
-    c.disks.part_prefix = prefix;
     c.install.boot_mode = boot_mode.to_string();
     if let Some(r) = release {
         c.install.release = r.to_string();
@@ -434,24 +402,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn part_prefix_follows_kernel_rule() {
-        assert_eq!(part_prefix("sda"), "");
-        assert_eq!(part_prefix("vda"), "");
-        assert_eq!(part_prefix("nvme0n1"), "p");
-        assert_eq!(part_prefix("mmcblk0"), "p");
-    }
-
-    #[test]
-    fn resolve_prefix_flags_mixed_members() {
-        let m = vec!["sda".to_string(), "sdb".to_string()];
-        assert_eq!(resolve_prefix(&m), ("".to_string(), false));
-        let m = vec!["nvme0n1".to_string(), "nvme1n1".to_string()];
-        assert_eq!(resolve_prefix(&m), ("p".to_string(), false));
-        let m = vec!["sda".to_string(), "nvme0n1".to_string()];
-        assert!(resolve_prefix(&m).1);
-    }
-
-    #[test]
     fn default_level_fits_the_member_count() {
         assert_eq!(default_level(Family::Md, 4), "6");
         assert_eq!(default_level(Family::Md, 3), "5");
@@ -491,7 +441,7 @@ nvme1n1 512110190592 0 disk Samsung SSD
     #[test]
     fn assembled_config_validates() {
         let m = vec!["sda".to_string(), "sdb".to_string(), "sdc".to_string()];
-        let c = assemble("dm-crypt~zfs", "raidz1", &m, "".to_string(), "efi", None);
+        let c = assemble("dm-crypt~zfs", "raidz1", &m, "efi", None);
         assert!(c.validate().is_ok());
         assert_eq!(c.crypt.integrity, "none");
     }

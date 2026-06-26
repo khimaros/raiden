@@ -10,6 +10,10 @@ use crate::config::{Config, STACK_BCACHEFS};
 use crate::layout::Layout;
 use crate::step::Step;
 
+// crypttab options for this stack's per-disk members. shared between the install
+// write and the running-system regen (replace --with) so the two cannot drift.
+const CRYPTTAB_OPTS: &str = "luks,discard,initramfs,keyscript=decrypt_keyctl";
+
 // the apt.bcachefs.org signing key (armored). embedded so neither the live host
 // nor the target chroot needs a downloader to add the repo.
 const BCACHEFS_APT_KEY: &str = r#"-----BEGIN PGP PUBLIC KEY BLOCK-----
@@ -147,9 +151,9 @@ impl Stack for BcachefsStack {
             super::install_keyutils(),
             // initramfs: pull every crypt member into the initrd so the
             // multi-device bcachefs root can unlock all its devices at boot.
-            super::crypttab_step(layout, "luks,discard,initramfs,keyscript=decrypt_keyctl"),
+            super::crypttab_step(layout, CRYPTTAB_OPTS, "/mnt/etc/crypttab"),
         ];
-        s.extend(super::backup_luks_headers(layout));
+        s.extend(super::backup_luks_headers(layout, "/mnt/boot"));
         s.push(super::fstab_root_bcachefs(layout));
         s.push(super::update_initramfs());
         s
@@ -224,6 +228,43 @@ impl Stack for BcachefsStack {
                 .best_effort()
             })
             .collect()
+    }
+
+    fn crypttab_regen(&self, layout: &Layout) -> Option<Step> {
+        Some(super::crypttab_step(layout, CRYPTTAB_OPTS, "/etc/crypttab"))
+    }
+
+    fn initramfs_binaries(&self) -> Vec<&'static str> {
+        let mut b = super::crypt_initramfs_binaries();
+        b.push("bcachefs");
+        b
+    }
+
+    // bcachefs, like btrfs, refuses a multi-device mount with a faulty member and
+    // needs a manual degraded mount from a surviving crypt device.
+    fn recover_actions(
+        &self,
+        _cfg: &Config,
+        layout: &Layout,
+        at: &str,
+    ) -> Vec<super::RecoverAction> {
+        let devs = layout.crypt_devices().join(" ");
+        vec![
+            super::RecoverAction::new(
+                "scan bcachefs devices",
+                vec![Step::sh("scan bcachefs devices", "bcachefs device scan 2>/dev/null || true")
+                    .best_effort()],
+            ),
+            super::RecoverAction::new(
+                format!("mount the bcachefs root (degraded) at {at}"),
+                vec![Step::sh(
+                    format!("mount the bcachefs root (degraded) at {at}"),
+                    format!(
+                        "for d in {devs}; do mount -t bcachefs -o degraded \"$d\" {at} 2>/dev/null && break; done"
+                    ),
+                )],
+            ),
+        ]
     }
 
     fn close(&self, _cfg: &Config, layout: &Layout) -> Vec<Step> {

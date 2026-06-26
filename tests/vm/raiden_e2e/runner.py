@@ -183,7 +183,7 @@ def _connect(cfg, vm, supervisor, console_out) -> Console:
         cfg.name,
         logfile=console_out,
         supervisor=supervisor,
-        initramfs_recovery=INITRAMFS_RECOVERY.get(cfg.stack, []),
+        initramfs_recovery=INITRAMFS_RECOVERY,
     )
     con.unlock(cfg.password)
     log("unlocked; waiting for login")

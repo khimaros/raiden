@@ -3,14 +3,18 @@ mod benchmark;
 mod checkpoint;
 mod cli;
 mod config;
+mod doctor;
+mod efi;
 mod init;
 mod layout;
+mod manifest;
 mod ops;
 mod pipeline;
 mod prompt;
+mod recover;
 mod stack;
-mod state;
 mod step;
+mod sync;
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -19,10 +23,13 @@ use anyhow::{bail, Result};
 use clap::Parser;
 
 use checkpoint::Checkpoint;
-use cli::{BenchmarkArgs, Cli, Command, ConfigCmd, Global, InstallArgs, StatusArgs};
+use cli::{
+    BenchmarkArgs, Cli, Command, ConfigCmd, DoctorArgs, Global, InstallArgs, RecoverArgs,
+    StatusArgs, SyncArgs, SyncTarget,
+};
 use config::{Config, Family, Overrides};
 use layout::Layout;
-use state::State;
+use manifest::Manifest;
 use step::Phase;
 
 fn main() -> Result<()> {
@@ -41,13 +48,22 @@ fn main() -> Result<()> {
         Command::Config(ConfigCmd::Show) => cmd_config_show(g, &overrides),
         Command::Benchmark(args) => cmd_benchmark(g, &overrides, args),
         Command::Devices => cmd_devices(g, &overrides),
+        Command::Doctor(args) => cmd_doctor(g, &overrides, args),
         Command::Status(args) => cmd_status(g, &overrides, args),
-        Command::Scrub { wait: _ } => run_op(g, &overrides, "scrub", false, |c, l, s| {
-            Ok(ops::scrub(c, l, s))
-        }),
-        Command::Rescue => run_op(g, &overrides, "rescue", false, |c, l, s| {
-            Ok(ops::rescue(c, l, s))
-        }),
+        Command::Scrub { wait: _ } => {
+            require_installed(g)?;
+            let (cfg, stack) = resolve_op(g, &overrides)?;
+            run_op(g, &cfg, stack.as_ref(), "scrub", false, "", |c, l, s| {
+                Ok(ops::scrub(c, l, s))
+            })
+        }
+        Command::Rescue => {
+            let (cfg, stack) = resolve_op(g, &overrides)?;
+            run_op(g, &cfg, stack.as_ref(), "rescue", false, "", |c, l, s| {
+                Ok(ops::rescue(c, l, s))
+            })
+        }
+        Command::Recover(args) => cmd_recover(g, &overrides, args),
         Command::Mount(args) => {
             // full mount lands at /mnt (mount_root is /mnt-relative); --boot honors
             // --at so the running system can be fixed in place with `--at /`.
@@ -57,31 +73,47 @@ fn main() -> Result<()> {
             } else {
                 "/mnt".to_string()
             };
-            run_op(g, &overrides, "mount", false, move |c, l, s| {
-                Ok(ops::mount(c, l, s, boot, &at))
+            let (cfg, stack) = resolve_op(g, &overrides)?;
+            run_op(
+                g,
+                &cfg,
+                stack.as_ref(),
+                "mount",
+                false,
+                "",
+                move |c, l, s| Ok(ops::mount(c, l, s, boot, &at)),
+            )
+        }
+        Command::Close => {
+            require_installed(g)?;
+            let (cfg, stack) = resolve_op(g, &overrides)?;
+            run_op(g, &cfg, stack.as_ref(), "close", false, "", |c, l, s| {
+                Ok(ops::close(c, l, s))
             })
         }
-        Command::Close => run_op(g, &overrides, "close", false, |c, l, s| {
-            Ok(ops::close(c, l, s))
-        }),
         Command::Replace {
             disks,
+            with,
             esp,
             boot,
             root,
-        } => {
-            let d = config::split_disks(disks);
-            let parts = ops::ReplaceParts::from_flags(*esp, *boot, *root);
-            run_op(g, &overrides, "replace", true, move |c, l, s| {
-                ops::replace(c, l, s, &d, &parts)
-            })
-        }
+        } => cmd_replace(g, &overrides, disks, with, *esp, *boot, *root),
         Command::Remove { disks } => {
+            require_installed(g)?;
             let d = config::split_disks(disks);
-            run_op(g, &overrides, "remove", true, move |c, l, s| {
-                ops::remove(c, l, s, &d)
-            })
+            let scope = format!("disks={}", d.join(","));
+            let (cfg, stack) = resolve_op(g, &overrides)?;
+            run_op(
+                g,
+                &cfg,
+                stack.as_ref(),
+                "remove",
+                true,
+                &scope,
+                move |c, l, s| ops::remove(c, l, s, &d),
+            )
         }
+        Command::Sync(args) => cmd_sync(g, &overrides, args),
     }
 }
 
@@ -97,13 +129,31 @@ fn overrides_from(g: &Global) -> Overrides {
 /// operations resolve config from the install manifest when present, falling
 /// back to the config file (eg. a fresh livecd rescue before any install).
 fn resolve_config(g: &Global, overrides: &Overrides) -> Result<Config> {
-    if State::exists() {
-        let mut c = State::load()?.config;
+    if Manifest::exists() {
+        let mut c = Manifest::load()?.config;
         c.merge(overrides);
         Ok(c)
     } else {
         Config::load(&g.config, overrides)
     }
+}
+
+/// post-install ops (doctor, sync, status, scrub, replace, remove, close) only make
+/// sense on an installed raiden system. require the manifest before doing anything,
+/// so a mutation can never run against a non-raiden host that merely has a config
+/// file in cwd (eg. `doctor --fix` writing hooks to a dev box's /etc/kernel). a
+/// `--dry-run` only previews a plan and is exempt; rescue/mount/recover run from a
+/// livecd or the initramfs (manifest baked in) and do not call this.
+fn require_installed(g: &Global) -> Result<()> {
+    if !g.dry_run && !Manifest::exists() {
+        bail!(
+            "no raiden install manifest found ({} or {}); this command only runs on \
+             an installed raiden system. use --dry-run to preview a plan.",
+            manifest::BOOT_MIRROR_PATH,
+            manifest::DEFAULT_PATH
+        );
+    }
+    Ok(())
 }
 
 fn cmd_install(g: &Global, overrides: &Overrides, args: &InstallArgs) -> Result<()> {
@@ -157,7 +207,7 @@ fn cmd_install(g: &Global, overrides: &Overrides, args: &InstallArgs) -> Result<
     }
     // the manifest is written into the target by the pipeline's finish phase
     // (while /mnt is still mounted), so it persists into the installed system.
-    run_plan("install", &plan, &cfg, g)?;
+    run_plan("install", &plan, &cfg, g, "")?;
     Ok(())
 }
 
@@ -178,15 +228,108 @@ fn install_guard(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn run_op<F>(g: &Global, overrides: &Overrides, op: &str, destructive: bool, build: F) -> Result<()>
+/// `raiden replace`: rebuild named members in place, or --with a physical disk
+/// swap. --disks=a,b --with=c,d swaps a->c, b->d by position, mutating the
+/// manifest: the new disks adopt the old disks' identifying esp/luks uuids (so
+/// fstab/crypttab stay valid) and are provisioned + re-added from the survivors.
+/// without --with, --disks are rebuilt in place (backward compatible). the old
+/// disks in a swap are detached best-effort (they may already be gone) and are
+/// never wiped; the new disks are wiped + provisioned.
+fn cmd_replace(
+    g: &Global,
+    overrides: &Overrides,
+    disks: &str,
+    with: &Option<String>,
+    esp: bool,
+    boot: bool,
+    root: bool,
+) -> Result<()> {
+    require_installed(g)?;
+    let mut cfg = resolve_config(g, overrides)?;
+    cfg.validate()?;
+    let stack = stack::select(&cfg.raid.stack)?;
+    let parts = ops::ReplaceParts::from_flags(esp, boot, root);
+    let d = config::split_disks(disks);
+
+    // --with: a physical swap. build the (old, new) pairs and mutate the config's
+    // members so the plan (and the saved manifest) reference the new disks.
+    let swap: Option<Vec<(String, String)>> = match with {
+        Some(w) => {
+            let new_disks = config::split_disks(w);
+            if new_disks.len() != d.len() {
+                bail!(
+                    "--disks has {} entr{{y,ies}} but --with has {}; they must pair 1:1",
+                    d.len(),
+                    new_disks.len()
+                );
+            }
+            for old in &d {
+                if !cfg.disks.members.contains(old) {
+                    bail!("{old:?} is not a configured member disk");
+                }
+            }
+            for new in &new_disks {
+                if cfg.disks.members.contains(new) {
+                    bail!("{new:?} is already a member; --with names new disks");
+                }
+                if d.contains(new) {
+                    bail!("{new:?} appears in both --disks and --with");
+                }
+            }
+            let pairs: Vec<(String, String)> =
+                d.iter().cloned().zip(new_disks.iter().cloned()).collect();
+            // mutate members: each old disk -> its paired new disk, by position.
+            for m in cfg.disks.members.iter_mut() {
+                if let Some((_, new)) = pairs.iter().find(|(old, _)| old == m) {
+                    *m = new.clone();
+                }
+            }
+            Some(pairs)
+        }
+        None => None,
+    };
+
+    // the disks to provision: the new disks (swap) or --disks (in-place).
+    let provision_disks: Vec<String> = swap
+        .as_ref()
+        .map(|p| p.iter().map(|(_, n)| n.clone()).collect())
+        .unwrap_or_else(|| d.clone());
+
+    // resume must match the exact target; capture it so changed --disks/--with/
+    // --parts cannot reuse this run's checkpoint cursor.
+    let scope = format!(
+        "disks={} with={} esp={} boot={} root={}",
+        d.join(","),
+        with.as_deref().unwrap_or(""),
+        parts.esp,
+        parts.boot,
+        parts.root
+    );
+    run_op(
+        g,
+        &cfg,
+        stack.as_ref(),
+        "replace",
+        true,
+        &scope,
+        move |c, l, s| ops::replace(c, l, s, &provision_disks, &parts, swap.as_deref()),
+    )
+}
+
+fn run_op<F>(
+    g: &Global,
+    cfg: &Config,
+    stack: &dyn stack::Stack,
+    op: &str,
+    destructive: bool,
+    scope: &str,
+    build: F,
+) -> Result<()>
 where
     F: FnOnce(&Config, &Layout, &dyn stack::Stack) -> Result<Vec<Phase>>,
 {
-    let cfg = resolve_config(g, overrides)?;
-    cfg.validate()?;
-    let layout = Layout::derive(&cfg);
-    let stack = stack::select(&cfg.raid.stack)?;
-    let plan = build(&cfg, &layout, stack.as_ref())?;
+    let layout = Layout::derive(cfg);
+    let plan = build(cfg, &layout, stack)?;
 
     if g.dry_run {
         step::print_plan(&plan);
@@ -195,24 +338,36 @@ where
     if destructive && !g.yes {
         guard(op)?;
     }
-    run_plan(op, &plan, &cfg, g)?;
-    if op == "replace" && State::exists() {
-        let _ = State::from_config(&cfg).save();
+    run_plan(op, &plan, cfg, g, scope)?;
+    if op == "replace" && Manifest::exists() {
+        let _ = Manifest::from_config(cfg).save();
     }
     Ok(())
 }
 
-/// execute a plan with checkpointing and resume.
-fn run_plan(op: &str, plan: &[Phase], cfg: &Config, g: &Global) -> Result<()> {
-    let path = Path::new(checkpoint::PATH);
+/// resolve config + stack for a post-install op (shared by the run_op callers).
+fn resolve_op(g: &Global, overrides: &Overrides) -> Result<(Config, Box<dyn stack::Stack>)> {
+    let cfg = resolve_config(g, overrides)?;
+    cfg.validate()?;
+    let stack = stack::select(&cfg.raid.stack)?;
+    Ok((cfg, stack))
+}
+
+/// execute a plan with checkpointing and resume. `scope` captures the op's
+/// destructive cli args (eg. replace's disks/layers) so resume refuses a changed
+/// target (which would reuse this cursor against a different plan).
+fn run_plan(op: &str, plan: &[Phase], cfg: &Config, g: &Global, scope: &str) -> Result<()> {
+    let path = checkpoint::path();
+    let path = path.as_path();
     let hash = checkpoint::config_hash(cfg);
-    let start = resume_start(op, &hash, g.resume, path)?;
+    let start = resume_start(op, &hash, scope, g.resume, path)?;
     let pw = if step::needs_password(plan) {
         Some(obtain_password(op, g)?)
     } else {
         None
     };
     let op_owned = op.to_string();
+    let scope_owned = scope.to_string();
     let result = step::execute_plan(
         plan,
         pw.as_deref(),
@@ -222,6 +377,7 @@ fn run_plan(op: &str, plan: &[Phase], cfg: &Config, g: &Global) -> Result<()> {
             Checkpoint {
                 operation: op_owned.clone(),
                 config_hash: hash.clone(),
+                scope: scope_owned.clone(),
                 phase,
                 step,
                 phase_name: name.to_string(),
@@ -245,7 +401,13 @@ fn run_plan(op: &str, plan: &[Phase], cfg: &Config, g: &Global) -> Result<()> {
 
 /// resolve the (phase, step) cursor to start from. a fresh run clears any stale
 /// checkpoint; --resume validates the checkpoint matches this op and config.
-fn resume_start(op: &str, hash: &str, resume: bool, path: &Path) -> Result<(usize, usize)> {
+fn resume_start(
+    op: &str,
+    hash: &str,
+    scope: &str,
+    resume: bool,
+    path: &Path,
+) -> Result<(usize, usize)> {
     if !resume {
         Checkpoint::clear(path);
         return Ok((0, 0));
@@ -257,6 +419,16 @@ fn resume_start(op: &str, hash: &str, resume: bool, path: &Path) -> Result<(usiz
     }
     if cp.config_hash != hash {
         bail!("config changed since the checkpoint; cannot resume safely");
+    }
+    if cp.scope != scope {
+        // the cursor is meaningless against a different plan; a changed target
+        // would skip the wrong steps. start fresh instead.
+        bail!(
+            "the {op} target changed since the checkpoint (was [{}], now [{}]); \
+             run without --resume to start fresh, or --resume with the original arguments",
+            cp.scope,
+            scope
+        );
     }
     eprintln!(
         "resuming {op} after phase {:?}, step {} (already-applied steps are skipped)",
@@ -294,6 +466,7 @@ fn guard(op: &str) -> Result<()> {
 }
 
 fn cmd_status(g: &Global, overrides: &Overrides, args: &StatusArgs) -> Result<()> {
+    require_installed(g)?;
     let cfg = resolve_config(g, overrides)?;
     cfg.validate()?;
     let is_md = matches!(cfg.family()?, Family::Md);
@@ -372,8 +545,57 @@ fn cmd_config_show(g: &Global, overrides: &Overrides) -> Result<()> {
         layout::ESP_MOUNT
     );
     println!("crypt names:  {}", layout.crypt_names().join(", "));
-    println!("manifest:     {} (written at install)", state::DEFAULT_PATH);
+    println!(
+        "manifest:     {} (canonical; mirrored to {})",
+        manifest::BOOT_MIRROR_PATH,
+        manifest::DEFAULT_PATH
+    );
     Ok(())
+}
+
+fn cmd_sync(g: &Global, overrides: &Overrides, args: &SyncArgs) -> Result<()> {
+    // sync runs directly (not as a checkpointed plan): the source and mirror set
+    // are resolved at run time, and the kernel/grub hooks call it from a wrapper.
+    require_installed(g)?;
+    let cfg = resolve_config(g, overrides)?;
+    cfg.validate()?;
+    let layout = Layout::derive(&cfg);
+    let force = match &args.target {
+        SyncTarget::Boot(a) => a.force,
+        SyncTarget::Efi(a) => a.force,
+    };
+    sync::run(&args.target, &layout, g.yes, force, g.verbose, g.dry_run)
+}
+
+fn cmd_doctor(g: &Global, overrides: &Overrides, args: &DoctorArgs) -> Result<()> {
+    // doctor reports installed-system health, resolving config from the manifest
+    // like the other post-install ops. --fix repairs the auto-fixable checks,
+    // prompting before each one unless --yes; --fix --dry-run previews the exact
+    // repairs (commands + devices) without touching anything. no checkpoint.
+    require_installed(g)?;
+    let cfg = resolve_config(g, overrides)?;
+    cfg.validate()?;
+    let layout = Layout::derive(&cfg);
+    doctor::run(&cfg, &layout, g.verbose, args.fix, g.yes, g.dry_run)
+}
+
+/// `raiden recover`: bring a degraded root online from the initramfs (or a livecd)
+/// so the boot can continue. resolves config from the manifest (baked into the
+/// initrd) or a config file; like rescue/mount it is a recovery op and does not
+/// require an install manifest up front. crypt members are already open by the
+/// initramfs, so this needs no password.
+fn cmd_recover(g: &Global, overrides: &Overrides, args: &RecoverArgs) -> Result<()> {
+    let (cfg, stack) = resolve_op(g, overrides)?;
+    let layout = Layout::derive(&cfg);
+    recover::run(
+        &cfg,
+        &layout,
+        stack.as_ref(),
+        &args.at,
+        g.yes,
+        g.dry_run,
+        g.verbose,
+    )
 }
 
 fn cmd_devices(g: &Global, overrides: &Overrides) -> Result<()> {
@@ -412,4 +634,46 @@ fn filter_phases(
         return Ok(phases.into_iter().skip(start).collect());
     }
     Ok(phases)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // resume must refuse a changed destructive scope (eg. different replace
+    // --disks/--parts), since the checkpoint cursor is meaningless against a
+    // different plan -- the bug that silently skipped the wrong replace steps.
+    #[test]
+    fn resume_refuses_a_changed_scope() {
+        let path =
+            std::env::temp_dir().join(format!("raiden-resume-scope-{}.toml", std::process::id()));
+        let orig = "disks=nvme0n1,nvme1n1 esp=true boot=true root=true";
+        Checkpoint {
+            operation: "replace".into(),
+            config_hash: "abc".into(),
+            scope: orig.into(),
+            phase: 2,
+            step: 0,
+            phase_name: "partition".into(),
+        }
+        .save(&path)
+        .unwrap();
+
+        // same op + config hash but a different target must not resume.
+        assert!(resume_start(
+            "replace",
+            "abc",
+            "disks=nvme1n1 esp=false boot=false root=true",
+            true,
+            &path
+        )
+        .is_err());
+        // the exact original scope resumes from the next step.
+        assert_eq!(
+            resume_start("replace", "abc", orig, true, &path).unwrap(),
+            (2, 1)
+        );
+
+        Checkpoint::clear(&path);
+    }
 }

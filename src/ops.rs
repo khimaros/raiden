@@ -10,7 +10,9 @@ use crate::pipeline;
 use crate::stack::Stack;
 use crate::step::{Phase, Step};
 
-const SHIM: &str = r"\EFI\debian\shimx64.efi";
+// filesystem-relative marker for an independent /boot clone; the esp marker
+// (efi::SHIM_FILE) and the efibootmgr/shim paths live in crate::efi.
+const GRUB_CFG_FILE: &str = "grub/grub.cfg";
 
 /// assemble + unlock + mount from a livecd, after first installing tools and
 /// tearing down any partial state.
@@ -125,12 +127,21 @@ impl ReplaceParts {
 /// disk; a partial one (eg. `--esp --boot`) rebuilds only those partitions in
 /// place and leaves the root member -- and its array -- untouched, so it skips the
 /// (slow) resilver.
+///
+/// `disks` are the disks to provision. `with` is Some when this is a physical
+/// swap (`--disks=a --with=c`): it carries the (old, new) pairs, where `disks`
+/// are the new disks. the old disks are detached best-effort (they may be gone)
+/// and are NOT wiped; the new disks are wiped + provisioned. the layout passed in
+/// already reflects the swap (members mutated), so device derivation targets the
+/// new disks; the old disks' partition/crypt paths are derived by name (Layout's
+/// part/crypt_name are pure functions of the disk name, not the members list).
 pub fn replace(
     cfg: &Config,
     layout: &Layout,
     stack: &dyn Stack,
     disks: &[String],
     parts: &ReplaceParts,
+    with: Option<&[(String, String)]>,
 ) -> Result<Vec<Phase>> {
     check_members(layout, disks)?;
     let healthy: Vec<String> = layout
@@ -143,26 +154,34 @@ pub fn replace(
         bail!("cannot replace every disk at once; at least one member must survive to clone from");
     }
     let efi = cfg.install.boot_mode == "efi";
+    // the old disks being swapped out (empty for an in-place rebuild).
+    let old_disks: Vec<String> = with
+        .map(|pairs| pairs.iter().map(|(o, _)| o.clone()).collect())
+        .unwrap_or_default();
+    let is_swap = !old_disks.is_empty();
 
-    // remove: detach the selected layers and wipe their partitions.
+    // remove: detach the outgoing layers and wipe the incoming disks. for a swap,
+    // the OLD disks are detached (they may be gone) and never wiped; the NEW
+    // disks are wiped + provisioned. for in-place, detach and wipe are the same.
+    let detach_disks: &[String] = if is_swap { &old_disks } else { disks };
     let mut rm = Vec::new();
     if parts.boot {
-        rm.extend(boot_detach(layout, disks));
+        rm.extend(boot_detach(layout, detach_disks));
         // independent /boot mounts by the shared uuid, so the live /boot may sit on
-        // a disk we are about to rebuild; move it to a survivor first.
+        // an outgoing disk; move it to a survivor first.
         if !layout.boot_raid() {
-            rm.push(relocate_boot_step(layout, disks, &healthy[0]));
+            rm.push(relocate_boot_step(layout, detach_disks, &healthy[0]));
         }
     }
     if parts.root {
-        rm.extend(stack.remove(cfg, layout, disks));
+        rm.extend(stack.remove(cfg, layout, detach_disks));
     }
     if parts.esp {
         // the primary esp is mounted at /boot/efi on a healthy system; unmount the
-        // esp of any disk being rebuilt before wipefs/mkfs touch it, or mkfs.msdos
+        // esp of any outgoing disk before wipefs/mkfs touch it, or mkfs.msdos
         // refuses ("contains a mounted filesystem"). best-effort: a mirror esp or a
         // destroyed primary is not mounted.
-        for d in disks {
+        for d in detach_disks {
             let esp = layout.part(d, 1);
             rm.push(
                 Step::run_owned(
@@ -176,6 +195,7 @@ pub fn replace(
     // udev releases the just-closed crypt/dm devices asynchronously; settle before
     // wiping and repartitioning so the freed partitions are not still "busy".
     rm.push(Step::run("settle udev after teardown", &["udevadm", "settle"]).best_effort());
+    // wipe the incoming (new / in-place) disks. a swap never wipes the old disks.
     for d in disks {
         for p in parts.part_numbers() {
             let dev = layout.part(d, p);
@@ -191,7 +211,7 @@ pub fn replace(
 
     // partition: recreate the selected partitions (full = zap + recreate all;
     // partial = recreate just those in place), then bring up the root layer.
-    let mut pt = partition_replacements(layout, disks, efi, parts);
+    let mut pt = partition_replacements(layout, disks, efi, parts, &healthy);
     if parts.root {
         pt.extend(stack.partition_root(cfg, &layout.subset(disks)));
     }
@@ -217,14 +237,22 @@ pub fn replace(
         } else {
             // no array: re-create each replaced disk's /boot with the shared uuid
             // (so its grub finds a local copy); content is cloned in the bootloader
-            // phase.
-            let src = layout.part(&healthy[0], 2);
+            // phase. the shared uuid is canonical in fstab (the `/boot` entry);
+            // fall back to any survivor's /boot, and only let mkfs assign a fresh
+            // uuid if every copy is gone -- rather than failing on an empty uuid.
+            let srcs = healthy
+                .iter()
+                .map(|h| layout.part(h, 2))
+                .collect::<Vec<_>>()
+                .join(" ");
             re.extend(disks.iter().map(|d| {
                 let bdev = layout.part(d, 2);
                 Step::sh(
                     format!("format {bdev} as ext4 sharing the /boot uuid"),
                     format!(
-                        "u=$(blkid -s UUID -o value {src}); mkfs.ext4 -m 0 -F -U \"$u\" -L boot {bdev}"
+                        "u=$(awk '$2==\"/boot\" {{print $1}}' /etc/fstab | sed 's/^UUID=//'); \
+                         [ -n \"$u\" ] || for s in {srcs}; do u=$(blkid -s UUID -o value \"$s\"); [ -n \"$u\" ] && break; done; \
+                         if [ -n \"$u\" ]; then mkfs.ext4 -m 0 -F -U \"$u\" -L boot {bdev}; else mkfs.ext4 -m 0 -F -L boot {bdev}; fi"
                     ),
                 )
             }));
@@ -250,6 +278,15 @@ pub fn replace(
         Phase::new("partition", pt),
         Phase::new("reassemble", re),
     ];
+    // a physical swap changes the crypt mapper names (old -> new); rewrite
+    // /etc/crypttab so the new names map to the new disks' luks uuids. the
+    // per-member crypt stacks regenerate it from the (swapped) layout; md_integrity
+    // references the md array uuid (unchanged by a member swap) and returns None.
+    if is_swap {
+        if let Some(step) = stack.crypttab_regen(layout) {
+            phases.push(Phase::new("crypttab", vec![step]));
+        }
+    }
     let mut boot = repopulate_boot(layout, disks, &healthy[0], efi, parts);
     // the esp was unmounted for the rebuild; remount /boot + /boot/efi from the
     // first available member so the running system is left consistent (idempotent;
@@ -257,6 +294,14 @@ pub fn replace(
     if parts.esp || parts.boot {
         boot.extend(pipeline::boot_mount_steps(layout, "/", efi));
     }
+    // postcondition: every rebuilt mirror must independently carry its bootloader,
+    // so the shared-uuid mount can land on any survivor. fails the replace loudly
+    // if a clone left a mirror incomplete.
+    boot.extend(verify_bootloaders(
+        layout,
+        efi && parts.esp,
+        parts.boot && !layout.boot_raid(),
+    ));
     if !boot.is_empty() {
         phases.push(Phase::new("bootloader", boot));
     }
@@ -353,6 +398,7 @@ fn partition_replacements(
     disks: &[String],
     efi: bool,
     parts: &ReplaceParts,
+    healthy: &[String],
 ) -> Vec<Step> {
     let mut s = Vec::new();
     let esp_part = |dev: &str| {
@@ -399,35 +445,27 @@ fn partition_replacements(
         }
     }
     if efi && parts.esp {
+        // every esp shares one vfat uuid (stamped at install), so /boot/efi mounts
+        // from any survivor. re-stamp that shared uuid onto every rebuilt esp:
+        // read it from the /boot/efi fstab entry, fall back to any survivor's
+        // blkid, and only let mkfs assign a fresh id if every copy is gone.
+        let survivor_esps = healthy
+            .iter()
+            .map(|h| layout.part(h, 1))
+            .collect::<Vec<_>>()
+            .join(" ");
         for d in disks {
             let esp = layout.part(d, 1);
-            if layout.esp_is_primary(d) {
-                // the primary esp is the one in fstab at /boot/efi; keep its uuid
-                // so that entry stays valid. the others are mirrors (no fstab
-                // entry, fresh uuid) repopulated from a survivor by the esp hook.
-                s.push(Step::sh(
-                    format!("recreate primary esp on {esp} preserving its uuid"),
-                    format!(
-                        "uuid=$(awk '$2==\"/boot/efi\" {{print $1}}' /etc/fstab | sed 's/^UUID=//'); \
-                         if [ -n \"$uuid\" ]; then mkfs.msdos -F 32 -s 1 -n EFI -i \"$(echo $uuid | tr -d -)\" {esp}; \
-                         else mkfs.msdos -F 32 -s 1 -n EFI {esp}; fi"
-                    ),
-                ));
-            } else {
-                s.push(Step::run_owned(
-                    format!("recreate esp on {esp}"),
-                    vec![
-                        "mkfs.msdos".to_string(),
-                        "-F".to_string(),
-                        "32".to_string(),
-                        "-s".to_string(),
-                        "1".to_string(),
-                        "-n".to_string(),
-                        "EFI".to_string(),
-                        esp,
-                    ],
-                ));
-            }
+            s.push(Step::sh(
+                format!("recreate esp on {esp} sharing the esp uuid"),
+                format!(
+                    "u=$(awk '$2==\"/boot/efi\" {{print $1}}' /etc/fstab | sed 's/^UUID=//' | tr -d -); \
+                     [ -n \"$u\" ] || for s in {survivor_esps}; do u=$(blkid -s UUID -o value \"$s\" | tr -d -); [ -n \"$u\" ] && break; done; \
+                     if [ -n \"$u\" ]; then {with_uuid}; else {fresh}; fi",
+                    with_uuid = crate::efi::mkfs_esp_argv(&esp, Some("$u")).join(" "),
+                    fresh = crate::efi::mkfs_esp_argv(&esp, None).join(" "),
+                ),
+            ));
         }
     }
     s
@@ -449,29 +487,15 @@ fn repopulate_boot(
         let src = layout.part(healthy, 1);
         for d in disks {
             let dst = layout.part(d, 1);
-            s.push(Step::sh(
+            s.push(clone_partition(
                 format!("clone esp from {src} to {dst}"),
-                format!(
-                    "x=$(mktemp -d); y=$(mktemp -d); mount -o ro {src} \"$x\"; mount {dst} \"$y\"; \
-                     rsync --times --recursive --delete \"$x\"/ \"$y\"/; \
-                     umount \"$y\"; rmdir \"$y\"; umount \"$x\"; rmdir \"$x\""
-                ),
+                &src,
+                &dst,
+                crate::efi::SHIM_FILE,
             ));
             s.push(Step::run_owned(
                 format!("register efi boot entry for {d}"),
-                vec![
-                    "efibootmgr".to_string(),
-                    "-c".to_string(),
-                    "-g".to_string(),
-                    "-d".to_string(),
-                    format!("/dev/{d}"),
-                    "-p".to_string(),
-                    "1".to_string(),
-                    "-L".to_string(),
-                    format!("debian-{d}"),
-                    "-l".to_string(),
-                    SHIM.to_string(),
-                ],
+                crate::efi::register_argv(d),
             ));
         }
     } else if !efi && (parts.esp || parts.boot) {
@@ -484,22 +508,97 @@ fn repopulate_boot(
             ));
         }
     }
-    // independent /boot: clone the live /boot onto each rebuilt boot partition so
-    // its (now bootable) grub has a local copy.
+    // independent /boot: clone a survivor's /boot onto each rebuilt boot partition
+    // so its (now bootable) grub has a local copy. same guarded clone as the esp.
     if parts.boot && !layout.boot_raid() {
+        let src = layout.part(healthy, 2);
         for d in disks {
             let dst = layout.part(d, 2);
-            s.push(Step::sh(
-                format!("clone /boot to {dst}"),
-                format!(
-                    "y=$(mktemp -d); mount {dst} \"$y\"; \
-                     rsync --one-file-system --times --recursive --delete /boot/ \"$y\"/; \
-                     umount \"$y\"; rmdir \"$y\""
-                ),
+            s.push(clone_partition(
+                format!("clone /boot from {src} to {dst}"),
+                &src,
+                &dst,
+                GRUB_CFG_FILE,
             ));
         }
     }
     s
+}
+
+/// a guarded clone of a survivor's boot-region partition (esp or independent
+/// /boot) onto a freshly-rebuilt mirror. it mounts the source read-only and the
+/// destination, then runs `rsync --delete` ONLY after confirming the source
+/// mounted and carries `marker` -- so a failed or empty source can never wipe the
+/// destination (the bug that left a rebuilt esp without its bootloader); it then
+/// re-checks `marker` landed on the destination. shared by esp + /boot so both get
+/// the same safety, and fails loudly (non-zero) instead of shipping a broken copy.
+fn clone_partition(label: String, src: &str, dst: &str, marker: &str) -> Step {
+    Step::sh(
+        label,
+        // the source is mounted WITHOUT -o ro: it may be the live /boot (relocated
+        // to a survivor) or /boot/efi, and `mount -o ro` of an already-rw-mounted
+        // device fails "would change RO state" (exit 32) -- which left $x empty and
+        // let `rsync --delete` wipe the destination. a plain second mount shares the
+        // live superblock and succeeds; we only read from it, so rw is harmless.
+        format!(
+            "x=$(mktemp -d); y=$(mktemp -d); rc=1; \
+             if mount {src} \"$x\" && [ -e \"$x/{marker}\" ] && mount {dst} \"$y\"; then \
+               rsync --times --recursive --delete \"$x\"/ \"$y\"/ && [ -e \"$y/{marker}\" ] && rc=0; \
+             fi; \
+             umount \"$y\" 2>/dev/null; rmdir \"$y\" 2>/dev/null; \
+             umount \"$x\" 2>/dev/null; rmdir \"$x\" 2>/dev/null; \
+             exit $rc"
+        ),
+    )
+}
+
+/// postcondition steps for install/replace: every member esp (and, with an
+/// independent /boot, every member /boot) independently carries its bootloader, so
+/// any survivor can boot when the shared-uuid mount lands on it. fails loudly if a
+/// mirror is incomplete, catching it at creation time rather than silently shipping
+/// a mirror that cannot boot (the failure the vm caught: a rebuilt esp with no shim).
+pub fn verify_bootloaders(layout: &Layout, verify_esp: bool, verify_boot: bool) -> Vec<Step> {
+    let mut s = Vec::new();
+    if verify_esp {
+        // shim + grub, the same criteria doctor's esp bootloader check uses.
+        s.push(verify_marker_step(
+            "verify every esp carries the bootloader",
+            &layout.esp_devices(),
+            &[crate::efi::SHIM_FILE, crate::efi::GRUB_FILE],
+        ));
+    }
+    if verify_boot {
+        s.push(verify_marker_step(
+            "verify every /boot carries grub.cfg",
+            &layout.boot_devices(),
+            &[GRUB_CFG_FILE],
+        ));
+    }
+    s
+}
+
+/// transient-mount each member partition read-only and fail (non-zero) if any
+/// lacks `marker`; a missing device is skipped (its absence is a separate concern).
+fn verify_marker_step(label: &str, devices: &[String], markers: &[&str]) -> Step {
+    let devs = devices.join(" ");
+    // one `test -e` per marker, all required.
+    let tests: String = markers
+        .iter()
+        .map(|mk| format!("[ -e \"$m/{mk}\" ] || {{ echo \"$d: missing {mk}\" >&2; rc=1; }}; "))
+        .collect();
+    // mount WITHOUT -o ro: a member may be the live /boot or /boot/efi, and `mount
+    // -o ro` of an already-rw-mounted device fails "would change RO state". a plain
+    // second mount shares the live superblock; we only read (test -e), so rw is fine.
+    Step::sh(
+        label.to_string(),
+        format!(
+            "rc=0; for d in {devs}; do [ -b \"$d\" ] || continue; \
+             m=$(mktemp -d); \
+             if mount \"$d\" \"$m\" 2>/dev/null; then {tests}umount \"$m\" 2>/dev/null; \
+             else echo \"$d: cannot mount\" >&2; rc=1; fi; \
+             rmdir \"$m\" 2>/dev/null; done; exit $rc"
+        ),
+    )
 }
 
 /// delete a single partition by number, for a partial (in-place) replace.

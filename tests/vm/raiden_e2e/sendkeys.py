@@ -7,6 +7,15 @@ ported from raid-explorations' string_to_keycodes.py."""
 from __future__ import annotations
 
 import subprocess
+import time
+
+# `virsh send-key` is fire-and-forget: without a holdtime the chord's keys can be
+# released faster than the guest registers them, so a modifier (eg. LEFTSHIFT)
+# races its key and characters drop or garble. hold each chord, then pace between
+# chords so the guest input pipeline keeps up. tuned for reliability over speed --
+# the live phase types one short (~250 char) command, not the config.
+HOLDTIME_MS = 50
+KEY_INTERVAL_S = 0.05
 
 
 def _table() -> dict[str, list[str]]:
@@ -59,9 +68,10 @@ TABLE = _table()
 
 
 def press(vm_name: str, *codes: str) -> None:
-    """send one chord of raw linux keycodes (eg. KEY_END, or KEY_LEFTCTRL KEY_X)."""
+    """send one chord of raw linux keycodes (eg. KEY_END, or KEY_LEFTCTRL KEY_X),
+    held for HOLDTIME_MS so the guest registers the whole chord before release."""
     subprocess.run(
-        ["virsh", "send-key", vm_name, *codes],
+        ["virsh", "send-key", vm_name, "--holdtime", str(HOLDTIME_MS), *codes],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -74,6 +84,7 @@ def send_text(vm_name: str, text: str) -> None:
         if not codes:
             raise KeyError(f"no keycode mapping for character {ch!r}")
         press(vm_name, *codes)
+        time.sleep(KEY_INTERVAL_S)
 
 
 def send_line(vm_name: str, line: str) -> None:

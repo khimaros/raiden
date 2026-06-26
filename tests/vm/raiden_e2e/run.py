@@ -49,10 +49,11 @@ def main(argv: list[str] | None = None) -> int:
         "default runs all. see --list-scenarios",
     )
     p.add_argument(
-        "--skip-benchmark",
+        "--benchmark",
         action="store_true",
-        help="drop the sysbench benchmark (the costly fileio pass) from the run -- "
-        "for fast correctness or troubleshooting runs; the resilience checks remain",
+        help="add the sysbench benchmark (the costly fileio pass) to the run -- "
+        "off by default since it is orthogonal to correctness; the resilience "
+        "checks always run",
     )
     p.add_argument(
         "--list-scenarios",
@@ -111,10 +112,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # --scenario is repeatable and accepts comma-separated lists; validate names.
     selected = [n for item in args.scenario for n in item.split(",") if n]
-    # --skip-benchmark drops sysbench: from the explicit selection if given, else
-    # from the default bundle (which it materializes so rescue still runs).
-    if args.skip_benchmark:
-        selected = [n for n in (selected or sc.default_scenario_names()) if n != sc.BENCHMARK]
+    # the benchmark is off by default (orthogonal to resilience, ~26min);
+    # --benchmark adds sysbench, materializing the default bundle so the rest runs.
+    if args.benchmark and sc.BENCHMARK not in selected:
+        selected = [sc.BENCHMARK] + (selected or sc.default_scenario_names())
     known = sc.scenario_names()
     unknown = [n for n in selected if n not in known]
     if unknown:

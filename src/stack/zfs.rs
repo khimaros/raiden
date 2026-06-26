@@ -9,6 +9,10 @@ use crate::step::Step;
 
 const ROOT_DATASET: &str = "rpool/ROOT/debian";
 
+// crypttab options for this stack's per-disk members. shared between the install
+// write and the running-system regen (replace --with) so the two cannot drift.
+const CRYPTTAB_OPTS: &str = "luks,discard,initramfs,keyscript=decrypt_keyctl";
+
 pub struct ZfsStack;
 
 impl Stack for ZfsStack {
@@ -132,9 +136,9 @@ impl Stack for ZfsStack {
                 &["apt-get", "install", "-y", "zfs-initramfs", "keyutils"],
             )
             .chroot(),
-            super::crypttab_step(layout, "luks,discard,initramfs,keyscript=decrypt_keyctl"),
+            super::crypttab_step(layout, CRYPTTAB_OPTS, "/mnt/etc/crypttab"),
         ];
-        s.extend(super::backup_luks_headers(layout));
+        s.extend(super::backup_luks_headers(layout, "/mnt/boot"));
         s.push(Step::write(
             "force the zfs initrd to be rebuilt by dkms",
             "/mnt/etc/dkms/zfs.conf",
@@ -227,6 +231,55 @@ impl Stack for ZfsStack {
             );
         }
         s
+    }
+
+    fn crypttab_regen(&self, layout: &Layout) -> Option<Step> {
+        Some(super::crypttab_step(layout, CRYPTTAB_OPTS, "/etc/crypttab"))
+    }
+
+    fn initramfs_binaries(&self) -> Vec<&'static str> {
+        let mut b = super::crypt_initramfs_binaries();
+        b.extend(["zpool", "zfs"]);
+        b
+    }
+
+    // zfs auto-imports and mounts degraded at boot, so a drop to the rescue shell
+    // is rare; recover force-imports the pool (under the altroot `at`) and mounts
+    // the root dataset, for the case it stalled.
+    fn recover_actions(
+        &self,
+        _cfg: &Config,
+        _layout: &Layout,
+        at: &str,
+    ) -> Vec<super::RecoverAction> {
+        vec![
+            super::RecoverAction::new(
+                "import the zfs pool (forced)",
+                vec![
+                    Step::run("load the zfs module", &["modprobe", "zfs"]).best_effort(),
+                    Step::run_owned(
+                        format!("import {ZPOOL_NAME} under {at}"),
+                        vec![
+                            "zpool".into(),
+                            "import".into(),
+                            "-f".into(),
+                            "-N".into(),
+                            "-R".into(),
+                            at.into(),
+                            ZPOOL_NAME.into(),
+                        ],
+                    )
+                    .best_effort(),
+                ],
+            ),
+            super::RecoverAction::new(
+                format!("mount the root dataset at {at}"),
+                vec![Step::run_owned(
+                    format!("mount {ROOT_DATASET}"),
+                    vec!["zfs".into(), "mount".into(), ROOT_DATASET.into()],
+                )],
+            ),
+        ]
     }
 
     fn close(&self, _cfg: &Config, layout: &Layout) -> Vec<Step> {

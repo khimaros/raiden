@@ -29,7 +29,6 @@ pub enum BootMode {
 
 pub struct Layout {
     pub members: Vec<String>,
-    part_prefix: String,
     boot_mode: BootMode,
 }
 
@@ -37,7 +36,6 @@ impl Layout {
     pub fn derive(cfg: &Config) -> Self {
         Self {
             members: cfg.disks.members.clone(),
-            part_prefix: cfg.disks.part_prefix.clone(),
             boot_mode: if cfg.boot.raid {
                 BootMode::Raid
             } else {
@@ -50,9 +48,18 @@ impl Layout {
         self.boot_mode == BootMode::Raid
     }
 
-    /// "/dev/<disk><prefix><n>" for a member's nth partition.
+    /// "/dev/<disk><prefix><n>" for a member's nth partition. the kernel
+    /// partition separator is derived per disk: "p" when the disk name ends in
+    /// a digit (nvme0n1 -> nvme0n1p1, mmcblk0 -> mmcblk0p1), empty otherwise
+    /// (sda -> sda1). deriving it per disk lets a single array mix nvme and sd
+    /// members, which one global prefix could not.
     pub fn part(&self, disk: &str, n: u32) -> String {
-        format!("/dev/{}{}{}", disk, self.part_prefix, n)
+        let prefix = if disk.chars().last().is_some_and(|c| c.is_ascii_digit()) {
+            "p"
+        } else {
+            ""
+        };
+        format!("/dev/{disk}{prefix}{n}")
     }
 
     fn parts(&self, n: u32) -> Vec<String> {
@@ -78,18 +85,19 @@ impl Layout {
     }
 
     /// a layout over a subset of the members (eg. the disks being replaced),
-    /// keeping the same partition prefix and boot mode.
+    /// keeping the same boot mode.
     pub fn subset(&self, disks: &[String]) -> Layout {
         Layout {
             members: disks.to_vec(),
-            part_prefix: self.part_prefix.clone(),
             boot_mode: self.boot_mode,
         }
     }
 
     /// dm-crypt mapper name for a member's root partition, eg. "vda3_crypt".
     pub fn crypt_name(&self, disk: &str) -> String {
-        format!("{}{}{}_crypt", disk, self.part_prefix, PART_ROOT)
+        let n = self.part(disk, PART_ROOT);
+        // strip "/dev/" to form the mapper name from the partition device node.
+        format!("{}_crypt", n.trim_start_matches("/dev/"))
     }
 
     pub fn crypt_names(&self) -> Vec<String> {
@@ -113,7 +121,8 @@ impl Layout {
 
     /// dm-integrity mapper name for a member's root partition, eg. "vda3_int".
     pub fn int_name(&self, disk: &str) -> String {
-        format!("{}{}{}_int", disk, self.part_prefix, PART_ROOT)
+        let n = self.part(disk, PART_ROOT);
+        format!("{}_int", n.trim_start_matches("/dev/"))
     }
 
     pub fn int_names(&self) -> Vec<String> {
@@ -133,16 +142,15 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    fn layout_with(members: &[&str], prefix: &str) -> Layout {
+    fn layout_with(members: &[&str]) -> Layout {
         let mut c = Config::default();
         c.disks.members = members.iter().map(|s| s.to_string()).collect();
-        c.disks.part_prefix = prefix.to_string();
         Layout::derive(&c)
     }
 
     #[test]
     fn esp_primary_is_the_first_member() {
-        let l = layout_with(&["vda", "vdb", "vdc"], "");
+        let l = layout_with(&["vda", "vdb", "vdc"]);
         // the primary esp (mounted at /boot/efi) is the first member's p1; the
         // others are mirrors, synced from it.
         assert_eq!(l.esp_devices(), ["/dev/vda1", "/dev/vdb1", "/dev/vdc1"]);
@@ -163,14 +171,25 @@ mod tests {
 
     #[test]
     fn crypt_names_follow_root_partition() {
-        let l = layout_with(&["vda", "vdb"], "");
+        let l = layout_with(&["vda", "vdb"]);
         assert_eq!(l.crypt_names(), ["vda3_crypt", "vdb3_crypt"]);
     }
 
     #[test]
     fn nvme_prefix_applies_to_partitions() {
-        let l = layout_with(&["nvme0n1"], "p");
+        let l = layout_with(&["nvme0n1"]);
         assert_eq!(l.part("nvme0n1", 3), "/dev/nvme0n1p3");
+        assert_eq!(l.crypt_name("nvme0n1"), "nvme0n1p3_crypt");
+    }
+
+    #[test]
+    fn mixed_nvme_and_sd_members_get_per_disk_prefixes() {
+        // a single global prefix was broken for mixed arrays; each disk now
+        // derives its own separator.
+        let l = layout_with(&["sda", "nvme0n1"]);
+        assert_eq!(l.part("sda", 1), "/dev/sda1");
+        assert_eq!(l.part("nvme0n1", 1), "/dev/nvme0n1p1");
+        assert_eq!(l.crypt_name("sda"), "sda3_crypt");
         assert_eq!(l.crypt_name("nvme0n1"), "nvme0n1p3_crypt");
     }
 }

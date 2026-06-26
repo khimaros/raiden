@@ -78,6 +78,16 @@ def test_install_dry_run_has_key_steps(raiden):
     # before update-grub runs it. checking the exact target install line guards
     # against rsync being present only on the host.
     assert "chroot /mnt env DEBIAN_FRONTEND=noninteractive apt-get install -y grub-efi-amd64 shim-signed rsync" in out
+    # debconf preseeded before the grub package install: keep the EFI/BOOT removable
+    # fallback in sync on upgrades, but leave grub's own nvram management OFF --
+    # raiden owns the per-disk nvram entries (avoids duplicate/cruft accumulation).
+    assert "grub-efi-amd64 grub2/force_efi_extra_removable boolean true" in out
+    assert "grub-efi-amd64 grub2/update_nvram boolean false" in out
+    # grub is installed in both modes: the named EFI/debian layout (what the
+    # efibootmgr entries and sync/doctor verification check) and the removable
+    # EFI/BOOT fallback. both --no-nvram; raiden registers entries itself.
+    assert 'install grub to the esp (named)' in out
+    assert 'install grub to the esp (removable fallback)' in out
     # the primary esp mounts directly at /boot/efi by uuid (no per-slot mounts,
     # no symlink); the other esps are mirrors synced transiently under /run/raiden.
     assert "/boot/efi vfat" in out
@@ -90,16 +100,32 @@ def test_install_dry_run_has_key_steps(raiden):
     assert "mkfs.ext4 -m 0 -F -L boot /dev/vda2" in out
     assert "mkfs.ext4 -m 0 -F -U" in out  # the mirrors copy the primary's uuid
     assert 'echo "UUID=$uuid /boot ext4 defaults,nofail 0 2"' in out
-    # the mirrors have no fstab entry; the sync script mounts them transiently.
+    # the mirrors have no fstab entry; `sync boot` mounts them transiently
+    # under /run/raiden at runtime (inside the raiden binary, not the plan).
     assert "/boot.mirror" not in out
-    assert "/run/raiden" in out
-    assert "/mnt/usr/local/sbin/raiden-sync-boot-mirrors" in out
+    # the boot hooks are inline scripts (no separate wrapper file), one per dir.
     assert "/mnt/etc/kernel/postinst.d/zzz-raiden-boot-mirror" in out
+    assert "/mnt/etc/kernel/postrm.d/zzz-raiden-boot-mirror" in out
+    assert "exec /usr/local/sbin/raiden sync boot --yes" in out
+    # the hook must NOT forward run-parts' positional args (kernel version +
+    # bootdir): `sync boot` takes no positional, so clap would reject the call and
+    # the exit-code-propagating hook would block every kernel upgrade.
+    assert 'sync boot --yes "$@"' not in out
     # update-grub does not run the kernel hooks, so install syncs once explicitly.
-    assert "chroot /mnt /usr/local/sbin/raiden-sync-boot-mirrors --strict" in out
+    # invoked by absolute path: a chroot inherits the livecd's PATH, which lacks
+    # /usr/local/sbin where raiden is staged in the target.
+    assert "chroot /mnt /usr/local/sbin/raiden sync boot --yes" in out
+    # the efi mirrors are synced explicitly in the finish phase too (the grub.d
+    # hook no-ops at install, before raiden is staged into the target).
+    assert "chroot /mnt /usr/local/sbin/raiden sync efi --yes" in out
+    # postcondition after the syncs: every member esp/boot must carry its bootloader
+    # or the install fails loudly (so a survivor can boot when the shared uuid mounts
+    # /boot/efi or /boot from it).
+    assert "verify every esp carries the bootloader" in out
+    assert "verify every /boot carries grub.cfg" in out
     # the install manifest must be written into the target so post-install ops
     # (status/scrub/replace) resolve their config without a config file.
-    assert "/mnt/etc/raiden/state.toml" in out
+    assert "/mnt/etc/raiden/manifest.toml" in out
     # ...and the binary itself must be staged into the target, or those ops have
     # nothing to run after reboot. copied (not apt-installed) into /usr/local/sbin.
     assert "install -D -m 0755" in out
@@ -109,6 +135,41 @@ def test_install_dry_run_has_key_steps(raiden):
     # dosfstools must be installed in the TARGET (chroot): replace recreates esps
     # with mkfs.msdos on the running system, so it cannot live on the host only.
     assert "chroot /mnt env DEBIAN_FRONTEND=noninteractive apt-get install -y gdisk dosfstools mdadm" in out
+
+
+def test_install_bakes_raiden_into_the_initrd_for_recovery(raiden):
+    # initramfs_recovery (default on): after the binary + manifest are staged, the
+    # finish phase installs the raiden initramfs hook and rebuilds the initrd so it
+    # carries raiden + the manifest, making `raiden recover` available at the rescue
+    # shell. the hook copies the static binary in and the manifest to /etc/raiden.
+    out = raiden("install", "--dry-run").stdout
+    assert "/mnt/etc/initramfs-tools/hooks/raiden" in out
+    assert "copy_exec /usr/local/sbin/raiden /sbin" in out
+    assert "cp /etc/raiden/manifest.toml" in out
+    assert "chroot /mnt update-initramfs -u -k all" in out
+    # the hook is written only after the binary + manifest are staged (so the
+    # rebuild has something to bake), and the rebuild precedes the mirror sync (so
+    # the recovery-bearing initrd is what reaches every /boot mirror).
+    assert out.index("/mnt/usr/local/sbin/raiden") < out.index(
+        "/mnt/etc/initramfs-tools/hooks/raiden"
+    )
+    assert out.index("chroot /mnt update-initramfs -u -k all") < out.index(
+        "chroot /mnt /usr/local/sbin/raiden sync boot --yes"
+    )
+
+
+def test_recover_dry_run_prints_the_recovery_flow(raiden):
+    # `raiden recover --dry-run` previews the recovery flow (the exact commands, in
+    # order) without touching anything -- pure plan generation. the default md~lvm
+    # stack runs the array, activates lvm, then mounts /dev/vg0/root at /root (the
+    # initramfs convention).
+    out = raiden("recover", "--dry-run").stdout
+    assert "recovery flow" in out
+    assert "mdadm --run /dev/md/root" in out
+    assert "mount /dev/vg0/root /root" in out
+    # --at overrides the mount target (eg. /mnt from a livecd).
+    out2 = raiden("recover", "--dry-run", "--at", "/mnt").stdout
+    assert "mount /dev/vg0/root /mnt" in out2
 
 
 def test_benchmark_dry_run_emits_sysbench_plan(raiden):
@@ -148,15 +209,26 @@ def test_replace_esp_boot_skips_the_root_resilver(raiden):
     assert "luksFormat" not in out
 
 
+def test_replace_boot_uuid_reads_fstab_then_falls_back(raiden):
+    # the shared /boot uuid comes from fstab (canonical), then any survivor's
+    # /boot, and only mkfs's a fresh uuid if none exists -- it must not fail when
+    # one survivor's /boot has no uuid (the empty-blkid bug).
+    out = raiden("replace", "--disks", "vdb", "--dry-run").stdout
+    assert '$2=="/boot"' in out  # fstab is the primary source
+    assert "for s in /dev/vda2" in out  # fall back across surviving members
+    assert "mkfs.ext4 -m 0 -F -L boot /dev/vdb2" in out  # fresh-uuid fallback, not a failure
+
+
 def test_replace_unmounts_the_esp_before_rebuilding_it(raiden):
-    # the primary esp is mounted at /boot/efi on a healthy system; replace must
-    # unmount it before mkfs, or mkfs.msdos refuses "contains a mounted filesystem".
+    # /boot/efi is mounted on a healthy system; replace must unmount it before
+    # mkfs, or mkfs.msdos refuses "contains a mounted filesystem".
     out = raiden("replace", "--disks", "vda", "--esp", "--dry-run").stdout
     assert "umount /dev/vda1" in out
-    assert out.index("umount /dev/vda1") < out.index("recreate primary esp on /dev/vda1")
+    rebuild = "recreate esp on /dev/vda1 sharing the esp uuid"
+    assert out.index("umount /dev/vda1") < out.index(rebuild)
     # and it remounts /boot/efi afterward so the running system is left consistent.
     assert "mountpoint -q /boot/efi" in out
-    assert out.index("recreate primary esp on /dev/vda1") < out.index("mountpoint -q /boot/efi")
+    assert out.index(rebuild) < out.index("mountpoint -q /boot/efi")
 
 
 def _raid_boot_config(tmp_path):
@@ -179,7 +251,7 @@ def test_install_raid_boot_via_config(raiden, tmp_path):
     assert "mkfs.ext4 -m 0 /dev/md/boot" in out
     assert "/dev/md/boot /boot ext4" in out
     # the independent-boot machinery must be absent in raid mode.
-    assert "raiden-sync-boot-mirrors" not in out
+    assert "zzz-raiden-boot-mirror" not in out
     assert "/boot.mirror" not in out
 
 
@@ -189,9 +261,27 @@ def test_independent_boot_sync_runs_after_initramfs(raiden):
     # cryptsetup-less initrd, so a survivor booted after the primary's /boot is
     # destroyed cannot unlock luks and bring up the encrypted root.
     out = raiden("install", "--dry-run").stdout
-    sync = out.index("raiden-sync-boot-mirrors --strict")
+    # match the finish-phase chroot step, not the bootloader-phase hook (which
+    # also contains "raiden sync boot --yes" but runs before update-initramfs).
+    sync = out.index("chroot /mnt /usr/local/sbin/raiden sync boot --yes")
     initramfs = out.index("update-initramfs -c -k all")
     assert initramfs < sync, "boot mirrors must be synced after update-initramfs"
+
+
+# note: `sync boot/efi --dry-run` (non-raid) and `doctor` inspect the live host
+# (findmnt /boot, blkid, mdadm, efibootmgr, ...), so they are NOT exercised here --
+# the hermetic suite stays pure plan-generation against a config. the live behaviour
+# is covered in the controlled vm (the sync_mirrors and doctor/doctor_fix scenarios).
+
+
+def test_sync_boot_no_ops_when_boot_is_raid(raiden, tmp_path):
+    # when boot.raid is set, /boot is md raid1 and mdadm handles replication:
+    # `sync boot` must say so and succeed without planning any rsync.
+    out = raiden(
+        "sync", "boot", "--dry-run", "--config", _raid_boot_config(tmp_path)
+    ).stdout
+    assert "md raid1" in out
+    assert "rsync" not in out
 
 
 def test_rescue_activates_lvm_before_mount(raiden):
@@ -384,7 +474,7 @@ def test_replace_requires_a_surviving_disk(raiden):
 
 def test_replace_plans_for_subset(raiden):
     # default (independent) boot: no md array for /boot. each replaced disk's
-    # boot partition is reformatted with the shared uuid and the live /boot is
+    # boot partition is reformatted with the shared uuid and a survivor's /boot is
     # cloned onto it; the esp clone and root re-add are unchanged.
     out = raiden("replace", "--dry-run", "--disks", "vdb,vdc").stdout
     assert "clone esp from /dev/vda1 to /dev/vdb1" in out
@@ -393,7 +483,16 @@ def test_replace_plans_for_subset(raiden):
     assert "mdadm --remove /dev/md/root detached" in out
     assert "/dev/md/boot" not in out
     assert "mkfs.ext4 -m 0 -F -U" in out  # replaced boot fs shares the uuid
-    assert "clone /boot to /dev/vdb2" in out
+    assert "clone /boot from /dev/vda2 to /dev/vdb2" in out
+    # the clone refuses to rsync --delete from an unverified source (would wipe the
+    # mirror) and verifies the bootloader marker landed.
+    assert 'EFI/debian/shimx64.efi' in out and 'grub/grub.cfg' in out
+    # postcondition: replace fails loudly if a rebuilt mirror is missing its
+    # bootloader, rather than silently shipping an unbootable esp/boot. the esp
+    # check requires shim AND grub (the same criteria as doctor's bootloader check).
+    assert "verify every esp carries the bootloader" in out
+    assert "EFI/debian/grubx64.efi" in out  # esp postcondition checks grub too
+    assert "verify every /boot carries grub.cfg" in out
 
 
 def test_replace_preserves_luks_uuid(raiden):
@@ -446,6 +545,70 @@ def test_replace_raid_boot_waits_for_both_arrays(raiden, tmp_path):
     assert "mdadm --remove /dev/md/root detached" in out
 
 
+def test_replace_with_swaps_member_for_new_disk(raiden):
+    # --disks=vdb --with=sde physically swaps vdb for sde: the old disk is
+    # detached (best-effort, not wiped) and the new disk is provisioned +
+    # re-added. the plan targets the NEW disk's partitions throughout.
+    out = raiden("replace", "--dry-run", "--disks", "vdb", "--with", "sde").stdout
+    # detach the OLD disk's crypt member (vdb3_crypt), not the new one.
+    assert "cryptsetup luksClose vdb3_crypt" in out
+    assert "mdadm --remove /dev/md/root /dev/mapper/vdb3_crypt" in out
+    # the OLD disk is never wiped; only the NEW disk is.
+    assert "wipefs -a /dev/sde3" in out
+    assert "wipefs -a /dev/vdb" not in out
+    # provision + re-add the NEW disk under its own crypt name.
+    assert "luksFormat --cipher=aegis128-plain64" in out
+    assert "cryptsetup luksOpen /dev/sde3 sde3_crypt" in out
+    assert "mdadm --add /dev/md/root /dev/mapper/sde3_crypt" in out
+    # crypttab is regenerated with the new member (sde) in place of vdb.
+    assert "write /etc/crypttab" in out
+    assert "sde3_crypt UUID=$uuid" in out
+    assert "vdb3_crypt" not in out.split("=== phase: crypttab ===")[1]
+
+
+def test_replace_with_adopts_the_shared_esp_and_boot_uuid(raiden):
+    # every esp shares one vfat uuid and every /boot one ext4 uuid, so swapping the
+    # PRIMARY disk (vda) just re-stamps those shared uuids onto the new disk -- the
+    # /boot/efi fstab entry stays valid and resolves to the new esp.
+    out = raiden("replace", "--dry-run", "--disks", "vda", "--with", "sde").stdout
+    # the new disk's esp is recreated with the shared esp uuid (from fstab / a
+    # survivor), not a fresh one.
+    assert "recreate esp on /dev/sde1 sharing the esp uuid" in out
+    # /boot shares the uuid from fstab / a survivor.
+    assert "mkfs.ext4 -m 0 -F -U" in out
+    # esp content cloned from a survivor onto the new disk.
+    assert "clone esp from /dev/vdb1 to /dev/sde1" in out
+
+
+def test_replace_with_rejects_mismatched_lengths(raiden):
+    # --disks and --with must pair 1:1 by position.
+    r = raiden(
+        "replace", "--dry-run", "--disks", "vdb,vdc", "--with", "sde",
+        expect_ok=False,
+    )
+    assert r.returncode != 0
+    assert "1:1" in r.stderr
+
+
+def test_replace_with_rejects_new_disk_already_a_member(raiden):
+    # the --with disk must be a NEW disk, not an existing member.
+    r = raiden(
+        "replace", "--dry-run", "--disks", "vdb", "--with", "vdc",
+        expect_ok=False,
+    )
+    assert r.returncode != 0
+    assert "already a member" in r.stderr
+
+
+def test_replace_with_rejects_old_disk_not_a_member(raiden):
+    r = raiden(
+        "replace", "--dry-run", "--disks", "zzz", "--with", "sde",
+        expect_ok=False,
+    )
+    assert r.returncode != 0
+    assert "not a configured member" in r.stderr
+
+
 def test_scrub_independent_skips_boot_array(raiden, tmp_path):
     # independent /boot has no array to scrub; raid mode does.
     indep = raiden("scrub", "--dry-run").stdout
@@ -456,10 +619,50 @@ def test_scrub_independent_skips_boot_array(raiden, tmp_path):
     assert "mdadm --action=check /dev/md/boot" in raid
 
 
-def test_resume_without_checkpoint_fails(raiden):
-    r = raiden("install", "--resume", expect_ok=False)
+def test_resume_without_checkpoint_fails(raiden, tmp_path):
+    # no checkpoint at the (overridden, hermetic) path -> nothing to resume.
+    cp = tmp_path / "checkpoint.toml"
+    r = raiden("install", "--resume", expect_ok=False, env={"RAIDEN_CHECKPOINT": str(cp)})
     assert r.returncode != 0
     assert "no checkpoint" in r.stderr
+
+
+def test_resume_rejects_from_and_only(raiden):
+    # --resume continues an interrupted run as-is; combining it with a phase
+    # selector is contradictory and rejected up front.
+    for sel in (["--from", "mount"], ["--only", "partition"]):
+        r = raiden("install", "--resume", *sel, expect_ok=False)
+        assert r.returncode != 0
+        assert "cannot be combined" in r.stderr
+
+
+def test_resume_rejects_a_different_operation(raiden, tmp_path):
+    # a checkpoint from one op must not be resumed by another -- the cursor is
+    # meaningless against a different plan. resume validates this before touching
+    # disks. driven via `install` (unlike the post-install ops, install needs no
+    # manifest, so this stays hermetic): a replace checkpoint must not resume it.
+    cp = tmp_path / "checkpoint.toml"
+    cp.write_text(
+        'operation = "replace"\nconfig_hash = "abc"\nscope = ""\n'
+        'phase = 0\nstep = 0\nphase_name = "partition"\n'
+    )
+    r = raiden(
+        "install", "--resume",
+        expect_ok=False,
+        env={"RAIDEN_CHECKPOINT": str(cp)},
+    )
+    assert r.returncode != 0
+    assert "checkpoint is for" in r.stderr
+
+
+def test_post_install_ops_require_an_install_manifest(raiden):
+    # doctor/sync/status/scrub/replace/remove/close only run on an installed raiden
+    # system: with no manifest (and not --dry-run) they refuse up front, before
+    # inspecting or touching anything -- so a stray raiden.toml in cwd can't make
+    # `doctor --fix` mutate a non-install host. (bails at the guard, so host-safe.)
+    r = raiden("doctor", expect_ok=False)
+    assert r.returncode != 0
+    assert "only runs on an installed raiden system" in r.stderr
 
 
 def test_bios_mode_uses_bios_boot_partition(raiden):
@@ -483,7 +686,7 @@ def test_init_generates_a_valid_aead_config(raiden, tmp_path):
     text = out.read_text()
     assert 'stack = "dm-crypt~md~lvm~ext4"' in text
     assert '"sda"' in text and '"sdd"' in text
-    assert 'part_prefix = ""' in text  # bare sd* names take no partition separator
+    assert 'part_prefix' not in text  # derived per disk, never stored
     assert 'boot_mode = "efi"' in text
     assert 'cipher = "aegis128-plain64"' in text
     assert 'integrity = "aead"' in text
@@ -504,7 +707,7 @@ def test_init_detects_nvme_prefix_and_plain_crypt(raiden, tmp_path):
         "--stack", "dm-crypt~zfs", "--boot-mode", "bios",
     )
     text = out.read_text()
-    assert 'part_prefix = "p"' in text
+    assert 'part_prefix' not in text  # derived per disk, never stored
     assert 'level = "raidz2"' in text
     assert 'cipher = "aes-xts-plain64"' in text
     assert 'integrity = "none"' in text
@@ -521,6 +724,25 @@ def test_init_default_level_fits_the_disk_count(raiden, tmp_path):
     )
     assert 'level = "1"' in out.read_text()
     assert "config ok" in raiden("config", "validate", "--config", str(out)).stdout
+
+
+def test_mixed_nvme_and_sd_members_get_per_disk_partition_prefixes(raiden, tmp_path):
+    # part_prefix is gone: each disk derives its own separator. a mixed
+    # nvme+sd array must produce sda1 and nvme0n1p1 in the same plan, which one
+    # global prefix could not.
+    out = tmp_path / "mixed.toml"
+    raiden(
+        "init", "--non-interactive", "--output", str(out),
+        "--members", "sda,nvme0n1", "--stack", "dm-crypt~md~lvm~ext4",
+        "--level", "1", "--boot-mode", "efi",
+    )
+    plan = raiden("install", "--dry-run", "--config", str(out), "--only", "format").stdout
+    # the format phase addresses each member's partitions; the per-disk prefix
+    # makes nvme0n1p1 and sda1 coexist in one plan (one global prefix could not).
+    assert "/dev/sda1" in plan
+    assert "/dev/nvme0n1p1" in plan
+    assert "/dev/sda2" in plan
+    assert "/dev/nvme0n1p2" in plan
 
 
 def test_init_refuses_to_overwrite_without_force(raiden, tmp_path):

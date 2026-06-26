@@ -7,6 +7,11 @@ use crate::config::{Config, STACK_BTRFS};
 use crate::layout::Layout;
 use crate::step::Step;
 
+// crypttab options for this stack's per-disk members (initramfs pulls every member
+// in so the multi-device root unlocks at boot). shared between the install write
+// and the running-system regen (replace --with) so the two cannot drift.
+const CRYPTTAB_OPTS: &str = "luks,discard,initramfs,keyscript=decrypt_keyctl";
+
 pub struct BtrfsStack;
 
 impl Stack for BtrfsStack {
@@ -73,9 +78,9 @@ impl Stack for BtrfsStack {
             // initramfs: pull every crypt member into the initrd so the
             // multi-device btrfs root can unlock all its devices at boot (matching
             // the md and zfs stacks); without it the boot drops to the initramfs.
-            super::crypttab_step(layout, "luks,discard,initramfs,keyscript=decrypt_keyctl"),
+            super::crypttab_step(layout, CRYPTTAB_OPTS, "/mnt/etc/crypttab"),
         ];
-        s.extend(super::backup_luks_headers(layout));
+        s.extend(super::backup_luks_headers(layout, "/mnt/boot"));
         s.push(super::fstab_root_btrfs(layout));
         s.push(super::update_initramfs());
         s
@@ -178,6 +183,44 @@ impl Stack for BtrfsStack {
                 .best_effort()
             })
             .collect()
+    }
+
+    fn crypttab_regen(&self, layout: &Layout) -> Option<Step> {
+        Some(super::crypttab_step(layout, CRYPTTAB_OPTS, "/etc/crypttab"))
+    }
+
+    fn initramfs_binaries(&self) -> Vec<&'static str> {
+        let mut b = super::crypt_initramfs_binaries();
+        b.push("btrfs");
+        b
+    }
+
+    // btrfs refuses a multi-device mount with a faulty member by default, so a
+    // degraded boot needs a manual `mount -o degraded` from a surviving member;
+    // mount from each crypt member in turn (the live source disk may be the faulty
+    // one) and stop at the first that takes.
+    fn recover_actions(
+        &self,
+        _cfg: &Config,
+        layout: &Layout,
+        at: &str,
+    ) -> Vec<super::RecoverAction> {
+        let devs = layout.crypt_devices().join(" ");
+        vec![
+            super::RecoverAction::new(
+                "scan btrfs devices",
+                vec![Step::run("scan btrfs devices", &["btrfs", "device", "scan"]).best_effort()],
+            ),
+            super::RecoverAction::new(
+                format!("mount the btrfs root (degraded) at {at}"),
+                vec![Step::sh(
+                    format!("mount the btrfs root (degraded) at {at}"),
+                    format!(
+                        "for d in {devs}; do mount -o degraded \"$d\" {at} 2>/dev/null && break; done"
+                    ),
+                )],
+            ),
+        ]
     }
 
     fn close(&self, _cfg: &Config, layout: &Layout) -> Vec<Step> {

@@ -18,6 +18,9 @@ LEGEND = {
     "reboot": "the array assembles and root logs in after reboot",
     "clean": "previously detected errors clear after scrub",
     "rescue": "the root can be mounted and read from a livecd",
+    "report": "raiden doctor passes every installed-system check",
+    "sync": "the independent /boot and esp mirrors re-sync from the primary",
+    "repair": "a corrupted mirror is restored by a re-sync",
 }
 
 

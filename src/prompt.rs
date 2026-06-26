@@ -66,6 +66,17 @@ pub fn confirm(message: &str) -> Result<bool> {
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
+/// confirm a (destructive) action unless `yes` short-circuits the prompt. the one
+/// place the "--yes assumes yes, otherwise ask" rule lives, so every caller (sync,
+/// doctor --fix, ...) behaves identically.
+pub fn confirm_or_yes(yes: bool, message: &str) -> Result<bool> {
+    if yes {
+        Ok(true)
+    } else {
+        confirm(message)
+    }
+}
+
 /// ask for a line of input, returning `default` when the answer is empty.
 pub fn ask(prompt: &str, default: &str) -> Result<String> {
     print!("{prompt} [{default}]: ");

@@ -14,12 +14,30 @@ use crate::config::{
     Config, STACK_BCACHEFS, STACK_BTRFS, STACK_MD_INTEGRITY, STACK_MD_LVM_EXT4, STACK_MD_LVM_XFS,
     STACK_ZFS,
 };
-use crate::layout::{Layout, ROOT_MD_DEVICE};
+use crate::layout::{Layout, ROOT_MD_DEVICE, ROOT_MD_NAME};
 use crate::step::Step;
 
 // gpt addresses disks in 512-byte logical block addresses regardless of the
 // crypt sector size, so a sector size in bytes is this many lba sectors.
 const LBA_BYTES: u32 = 512;
+
+/// a recovery action: a labeled, ordered group of steps that brings one layer of
+/// a degraded root online from the initramfs. `raiden recover` checks (is the root
+/// mounted?), confirms each action (unless --yes), then runs its steps. defined
+/// here with the trait it belongs to.
+pub struct RecoverAction {
+    pub label: String,
+    pub steps: Vec<Step>,
+}
+
+impl RecoverAction {
+    pub fn new(label: impl Into<String>, steps: Vec<Step>) -> Self {
+        Self {
+            label: label.into(),
+            steps,
+        }
+    }
+}
 
 pub trait Stack {
     fn id(&self) -> &str;
@@ -49,6 +67,30 @@ pub trait Stack {
     fn remove(&self, cfg: &Config, layout: &Layout, disks: &[String]) -> Vec<Step>;
     /// unmount and tear down all of this stack's mappings.
     fn close(&self, cfg: &Config, layout: &Layout) -> Vec<Step>;
+
+    /// the ordered recovery actions that bring this stack's already-unlocked root
+    /// online from the initramfs and mount it (degraded/forced) at `at`. crypt
+    /// members are already open by the initramfs (cryptroot + decrypt_keyctl), so
+    /// these pick up at the array/mount layer. used by `raiden recover` -- each is
+    /// confirmed, then run, with the postcondition being root mounted at `at`.
+    fn recover_actions(&self, cfg: &Config, layout: &Layout, at: &str) -> Vec<RecoverAction>;
+
+    /// regenerate /etc/crypttab on the running system for the given layout, when a
+    /// `replace --with` swap changed the member (and thus crypt) names. None when
+    /// the stack's crypttab does not depend on member names (eg. md_integrity,
+    /// whose crypttab references the md array uuid). default: None.
+    fn crypttab_regen(&self, _layout: &Layout) -> Option<Step> {
+        None
+    }
+
+    /// binaries the initrd must carry to unlock and mount (or recover) this stack's
+    /// root at boot. the common base (the decrypt_keyctl keyscript + its keyctl, and
+    /// cryptsetup) plus the stack's assemble/mount tools. the single source for
+    /// doctor's initrd check (and reusable as an install postcondition); the stock
+    /// initramfs hooks pull them in -- raiden adds no hooks of its own.
+    fn initramfs_binaries(&self) -> Vec<&'static str> {
+        crypt_initramfs_binaries()
+    }
 
     /// apt pin file content for backports, when the stack needs specific pins.
     fn backports_pins(&self, _release: &str) -> Option<String> {
@@ -87,89 +129,79 @@ pub fn select(id: &str) -> Result<Box<dyn Stack>> {
     })
 }
 
-// the grub.d hook that resyncs every mirror esp from the live primary on
-// update-grub. the primary member's esp is mounted at /boot/efi; the others have
-// no persistent mount point and are mounted transiently under /run/raiden just
-// for the rsync. baked with the member esp devices (there are no fstab entries to
-// enumerate). a present mirror that cannot be written is a hard error; a missing
-// or dead disk is skipped so a degraded array does not block kernel upgrades.
-pub fn efi_mirror_hook(esp_devices: &[String]) -> String {
-    EFI_MIRROR_HOOK_TEMPLATE.replace("@DEVS@", &esp_devices.join(" "))
-}
+// the grub.d hook wrapper that resyncs every mirror esp from the live primary on
+// update-grub. a thin shim: the sync logic lives in `raiden sync efi`
+// (src/sync.rs), invoked here with --yes so the unattended update-grub skips the
+// interactive confirmation. the exit code is swallowed (|| true) so a verify or
+// mirror failure can never abort grub-mkconfig and block grub.cfg regeneration --
+// a broken esp mirror is not fixable from a hook, and wedging every grub upgrade
+// would be worse than a stale mirror (run `grub-install` then `raiden sync efi`
+// by hand to repair). the primary member's esp is mounted at /boot/efi; the
+// others have no persistent mount point and are mounted transiently under
+// /run/raiden by `raiden sync efi`.
+pub const EFI_MIRROR_WRAPPER: &str =
+    "#!/bin/sh\nexec 1>&2\n/usr/local/sbin/raiden sync efi --yes || true\n";
 
-// grub.d scripts emit grub config on stdout, so this one redirects all output to
-// stderr (it contributes no config -- it only mirrors esps as a side effect). the
-// device backing the live /boot/efi is skipped; the rest are the mirrors.
-const EFI_MIRROR_HOOK_TEMPLATE: &str = r#"#!/bin/sh
-set -u
-exec 1>&2
-mountpoint --quiet /boot/efi || exit 0
-src=$(findmnt -no SOURCE /boot/efi) || exit 0
-mkdir -p /run/raiden
-rc=0
-for dev in @DEVS@; do
-    [ -b "$dev" ] || continue
-    [ "$(readlink -f "$dev")" = "$(readlink -f "$src")" ] && continue
-    m=$(mktemp -d /run/raiden/esp.XXXXXX) || continue
-    if mount "$dev" "$m" && rsync --times --recursive --delete /boot/efi/ "$m"/; then
-        :
-    else
-        echo "efi: mirror $dev failed"
-        rc=1
-    fi
-    umount "$m" 2>/dev/null || true
-    rmdir "$m" 2>/dev/null || true
-done
-exit $rc
-"#;
+// where the esp mirror grub.d hook lives in the target. grub.d scripts run during
+// update-grub and emit grub config on stdout, so the wrapper redirects to stderr.
+pub const EFI_MIRROR_HOOK_PATH: &str = "/mnt/etc/grub.d/90_copy_to_efi_mirrors";
 
-// the standalone script that resyncs every disk's independent /boot from the live
-// primary. unlike the esp hook this is NOT a grub.d script: grub-mkconfig writes
+// the basename of the esp mirror grub.d hook, shared by doctor (installed path)
+// and the install pipeline (target path).
+pub const EFI_MIRROR_HOOK_NAME: &str = "90_copy_to_efi_mirrors";
+
+// the inline script installed into the kernel postinst.d/postrm.d hooks. a thin
+// shim: the actual sync logic lives in `raiden sync boot` (src/sync.rs), invoked
+// here with --yes so the hooks (which run unattended after a kernel package
+// upgrade) skip the interactive confirmation. the script propagates the exit
+// code, so a mirror failure surfaces and blocks the kernel upgrade -- a
+// degraded boot mirror should not silently let an upgrade complete. source
+// verification is on by default (no --force); the install finish phase runs
+// `raiden sync boot --yes` directly.
+//
+// unlike the esp hook this is NOT a grub.d script: grub-mkconfig writes
 // grub.cfg to a temp file and moves it into place only after the grub.d scripts
 // run, so a grub.d hook would mirror a stale grub.cfg. instead this runs from the
-// kernel postinst.d/postrm.d hooks (which fire after zz-update-grub) and once,
-// strictly, at install. every /boot shares one fs uuid (so each disk's grub finds
-// its local copy); the copies have no persistent mount point and are mounted
-// transiently under /run/raiden by device (the shared uuid cannot address a
-// specific disk). --strict makes a present-but-unwritable mirror a hard error;
-// the kernel hooks pass a kernel version (not --strict) so they stay best-effort
-// and never fail a package upgrade. --one-file-system keeps rsync from descending
-// into the /boot/efi esp mount.
-pub fn boot_mirror_sync(boot_devices: &[String]) -> String {
-    BOOT_MIRROR_SYNC_TEMPLATE.replace("@DEVS@", &boot_devices.join(" "))
-}
+// kernel postinst.d/postrm.d hooks (which fire after zz-update-grub). every /boot
+// shares one fs uuid (so each disk's grub finds its local copy); the copies have
+// no persistent mount point and are mounted transiently under /run/raiden by
+// device (the shared uuid cannot address a specific disk). --one-file-system keeps
+// rsync from descending into the /boot/efi esp mount.
+//
+// run-parts invokes the hook with the kernel version + bootdir as positional
+// args; they are NOT forwarded to `raiden sync boot` (which takes no positional
+// and always mirrors the whole /boot) -- forwarding them would make clap reject
+// the call and, since this hook propagates its exit code, block kernel upgrades.
+pub const BOOT_MIRROR_HOOK_CONTENT: &str =
+    "#!/bin/sh\nexec /usr/local/sbin/raiden sync boot --yes\n";
 
-const BOOT_MIRROR_SYNC_TEMPLATE: &str = r#"#!/bin/sh
-set -u
-strict=0
-[ "${1:-}" = "--strict" ] && strict=1
-mountpoint --quiet /boot || exit 0
-src=$(findmnt -no SOURCE /boot) || exit 0
-mkdir -p /run/raiden
-rc=0
-for dev in @DEVS@; do
-    [ -b "$dev" ] || continue
-    [ "$(readlink -f "$dev")" = "$(readlink -f "$src")" ] && continue
-    m=$(mktemp -d /run/raiden/boot.XXXXXX) || continue
-    if mount "$dev" "$m" && rsync --one-file-system --times --recursive --delete /boot/ "$m"/; then
-        :
-    else
-        echo "boot: mirror $dev failed" >&2
-        rc=1
-    fi
-    umount "$m" 2>/dev/null || true
-    rmdir "$m" 2>/dev/null || true
-done
-[ "$strict" = 1 ] && exit $rc
-exit 0
-"#;
-
-// where the boot mirror sync script and its kernel hooks live in the target.
-pub const BOOT_MIRROR_SYNC_PATH: &str = "/usr/local/sbin/raiden-sync-boot-mirrors";
 // must sort AFTER zz-update-grub so grub.cfg is final before we mirror it. a
 // "zzz-" prefix beats "zz-update-grub" in every locale (the third letter z > u),
 // unlike "zz_..." which a punctuation-ignoring collation could order before it.
 pub const BOOT_MIRROR_HOOK_NAME: &str = "zzz-raiden-boot-mirror";
+
+// initramfs hook that bakes the raiden binary and the install manifest into the
+// initrd, so `raiden recover` can bring a degraded root online from the rescue
+// shell. config-guarded by install.initramfs_recovery (default on). unlike the
+// stack tooling (cryptsetup/mdadm/...), which the stock initramfs hooks pull in,
+// nothing pulls raiden or the manifest in, so this hook is required for recover.
+// it copies the manifest to /etc/raiden inside the initrd, where Manifest::load
+// finds it with neither /boot nor the root mounted. runs in the chroot at
+// update-initramfs time, so /usr/local/sbin/raiden and /etc/raiden are the target's.
+pub const INITRAMFS_HOOK_RAIDEN: &str = r#"#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+. /usr/share/initramfs-tools/hook-functions
+copy_exec /usr/local/sbin/raiden /sbin
+mkdir -p "${DESTDIR}/etc/raiden"
+cp /etc/raiden/manifest.toml "${DESTDIR}/etc/raiden/manifest.toml"
+"#;
+
+// where the raiden recovery initramfs hook lives, relative to the system root.
+// the single canonical path shared by the install step, doctor's hook check, and
+// doctor's fix, so the establish and the verify cannot drift.
+pub const RAIDEN_RECOVERY_HOOK: &str = "/etc/initramfs-tools/hooks/raiden";
 
 // initramfs hook that force-loads dm_integrity, needed by dm-crypt aead.
 pub const INITRAMFS_HOOK_AEAD: &str = r#"#!/bin/sh
@@ -407,6 +439,34 @@ pub fn md_remove(
         s.push(teardown(d));
     }
     s
+}
+
+/// the recovery actions for the md-backed stacks (md~lvm~ext4/xfs and
+/// dm-integrity): the crypt layer is already open by the initramfs, so assemble +
+/// run the array (--run kicks a dirty-degraded array that stalled), activate lvm,
+/// then mount /dev/vg0/root at `at`. shared so the two md stacks recover identically.
+pub fn md_recover_actions(at: &str) -> Vec<RecoverAction> {
+    vec![
+        RecoverAction::new(
+            "assemble and run the root array, activate lvm",
+            vec![
+                md_assemble(ROOT_MD_NAME).best_effort(),
+                Step::run_owned(
+                    format!("run {ROOT_MD_DEVICE} (kick a stalled degraded array)"),
+                    vec!["mdadm".into(), "--run".into(), ROOT_MD_DEVICE.into()],
+                )
+                .best_effort(),
+                lvm_activate(),
+            ],
+        ),
+        RecoverAction::new(
+            format!("mount the root filesystem at {at}"),
+            vec![Step::run_owned(
+                format!("mount /dev/vg0/root at {at}"),
+                vec!["mount".into(), "/dev/vg0/root".into(), at.into()],
+            )],
+        ),
+    ]
 }
 
 /// the shared `partition_root` for the per-disk dm-crypt stacks (md~lvm~ext4,
@@ -652,8 +712,10 @@ pub fn modprobe(module: &str) -> Step {
     )
 }
 
-/// write the target crypttab, resolving each member's luks uuid via blkid.
-pub fn crypttab_step(layout: &Layout, opts: &str) -> Step {
+/// write the crypttab, resolving each member's luks uuid via blkid, to `target`
+/// (eg. "/mnt/etc/crypttab" at install, "/etc/crypttab" for a running-system
+/// regen after a `replace --with` swap).
+pub fn crypttab_step(layout: &Layout, opts: &str, target: &str) -> Step {
     let mut script = String::from("{\n");
     for disk in &layout.members {
         let dev = layout.part(disk, 3);
@@ -662,15 +724,26 @@ pub fn crypttab_step(layout: &Layout, opts: &str) -> Step {
             "uuid=$(blkid -s UUID -o value {dev}); echo \"{name} UUID=$uuid none {opts}\"\n"
         ));
     }
-    script.push_str("} > /mnt/etc/crypttab\n");
-    Step::sh(format!("write /mnt/etc/crypttab ({opts})"), script)
+    script.push_str(&format!("}} > {target}\n"));
+    Step::sh(format!("write {target} ({opts})"), script)
 }
 
 /// back up each member's luks header onto /boot for disaster recovery.
-pub fn backup_luks_headers(layout: &Layout) -> Vec<Step> {
-    let mut s = vec![Step::run(
-        "create luks header backup directory on /boot",
-        &["mkdir", "-p", "/mnt/boot/luks"],
+/// the initrd binaries common to every dm-crypt stack: cryptsetup, and the
+/// decrypt_keyctl keyscript with its keyctl (the type-once-cache-for-all-members
+/// unlock). per-stack assemble/mount tools are added by `Stack::initramfs_binaries`.
+pub fn crypt_initramfs_binaries() -> Vec<&'static str> {
+    vec!["cryptsetup", "keyctl", "decrypt_keyctl"]
+}
+
+/// back up each member's luks header under `<boot>/luks` ("/mnt/boot" at install,
+/// "/boot" for doctor's re-backup fix). cryptsetup refuses to overwrite, so callers
+/// that may re-run (doctor) clear the dir first.
+pub fn backup_luks_headers(layout: &Layout, boot: &str) -> Vec<Step> {
+    let dir = format!("{boot}/luks");
+    let mut s = vec![Step::run_owned(
+        "create luks header backup directory on /boot".to_string(),
+        vec!["mkdir".to_string(), "-p".to_string(), dir.clone()],
     )];
     for d in &layout.members {
         let dev = layout.part(d, 3);
@@ -681,7 +754,7 @@ pub fn backup_luks_headers(layout: &Layout) -> Vec<Step> {
                 "luksHeaderBackup".to_string(),
                 dev,
                 "--header-backup-file".to_string(),
-                format!("/mnt/boot/luks/{d}3-headers.bin"),
+                format!("{dir}/{d}3-headers.bin"),
             ],
         ));
     }
@@ -704,4 +777,52 @@ pub fn update_initramfs() -> Step {
         &["update-initramfs", "-c", "-k", "all"],
     )
     .chroot()
+}
+
+/// rebuild the initrd for all kernels in UPDATE mode (vs `update_initramfs`'s
+/// create). `chroot` for the install target, direct for the running system. shared
+/// by install's recovery bake and doctor's initrd/recover-bundle fixes.
+pub fn update_initramfs_u(chroot: bool) -> Step {
+    let s = Step::run(
+        "rebuild the initramfs",
+        &["update-initramfs", "-u", "-k", "all"],
+    );
+    if chroot {
+        s.chroot()
+    } else {
+        s
+    }
+}
+
+/// install the raiden recovery initramfs hook under `root` ("/mnt" at install, ""
+/// on the running system). the hook bakes raiden + the manifest into the initrd so
+/// `raiden recover` is available at the rescue shell. the one establish form, shared
+/// by the install pipeline and doctor's recover-bundle fix.
+pub fn raiden_recovery_hook_step(root: &str) -> Step {
+    Step::write_mode(
+        "install the raiden recovery initramfs hook",
+        format!("{root}{RAIDEN_RECOVERY_HOOK}"),
+        INITRAMFS_HOOK_RAIDEN,
+        0o755,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // the kernel postinst.d/postrm.d hooks are run by run-parts with the kernel
+    // version and bootdir as positional args ($1, $2). `raiden sync boot` takes no
+    // positional, so a hook that forwards "$@" makes clap reject the call (exit 2);
+    // because the boot hook propagates its exit code, that fails the hook and
+    // blocks every kernel/initramfs upgrade. the hook must invoke sync without
+    // forwarding those args (sync always mirrors the whole /boot regardless).
+    #[test]
+    fn boot_mirror_hook_does_not_forward_runparts_args() {
+        assert!(BOOT_MIRROR_HOOK_CONTENT.contains("raiden sync boot --yes"));
+        assert!(
+            !BOOT_MIRROR_HOOK_CONTENT.contains("$@"),
+            "boot hook must not forward run-parts positional args to `raiden sync boot`"
+        );
+    }
 }

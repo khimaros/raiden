@@ -48,18 +48,19 @@ def test_scenario_selection():
     assert [s.__name__ for s in picked] == ["truncate_disks", "corrupt_efiboot"]
 
 
-def test_skip_benchmark_drops_sysbench_keeps_resilience():
-    # --skip-benchmark runs the default bundle minus the costly sysbench pass, so
-    # fast correctness/troubleshooting runs skip it but still exercise the
-    # resilience scenarios and the rescue flow.
+def test_benchmark_off_by_default():
+    # the default bundle is resilience-only: the sysbench benchmark is opt-in, so a
+    # plain run skips the costly pass but still exercises the resilience scenarios
+    # and the rescue flow.
     from raiden_e2e import scenarios as sc
 
     defaults = sc.default_scenario_names()
-    assert sc.BENCHMARK == "sysbench" and defaults[0] == "sysbench"
+    assert sc.BENCHMARK == "sysbench"
+    assert "sysbench" not in defaults
     assert "rescue" in defaults  # rescue is part of the default bundle
-    skipped = [n for n in defaults if n != sc.BENCHMARK]
-    assert "sysbench" not in skipped
-    assert {"corrupt_data_within", "corrupt_headers", "truncate_disks", "rescue"} <= set(skipped)
+    assert {"corrupt_data_within", "corrupt_headers", "truncate_disks"} <= set(defaults)
+    # the empty/default selection also omits the benchmark.
+    assert "sysbench" not in [s.__name__ for s in sc.select_inplace([])]
 
 
 def test_render_config_from_example():
@@ -74,6 +75,7 @@ def test_render_config_from_example():
         str(EXAMPLES_DIR / "dm-crypt~zfs.raidz2.toml"),
         ["vda", "vdb", "vdc"],
         boot_raid=True,
+        with_benchmark=True,
     )
     cfg = tomllib.loads(text)
     # preserved from the example unchanged:
@@ -84,22 +86,55 @@ def test_render_config_from_example():
     assert cfg["install"]["serial_console"] is True
     assert cfg["disks"]["members"] == ["vda", "vdb", "vdc"]
     assert cfg["boot"]["raid"] is True
-    # the benchmark package is installed for a default run...
+    # opting in adds the benchmark package...
     assert "sysbench" in cfg["install"]["extra_packages"]
 
 
-def test_render_config_skips_benchmark_package():
+def test_render_config_default_omits_benchmark_package():
     import tomllib
 
     from raiden_e2e.config import EXAMPLES_DIR
     from raiden_e2e.vm import render_config
 
-    # ...but a --skip-benchmark run does not install sysbench (nothing else needs it).
-    text = render_config(
-        str(EXAMPLES_DIR / "dm-crypt~zfs.raidz2.toml"), ["vda", "vdb"], with_benchmark=False
-    )
+    # ...but the default (benchmark off) does not install sysbench (nothing else
+    # needs it).
+    text = render_config(str(EXAMPLES_DIR / "dm-crypt~zfs.raidz2.toml"), ["vda", "vdb"])
     cfg = tomllib.loads(text)
     assert "sysbench" not in cfg["install"]["extra_packages"]
+
+
+def test_send_key_holds_each_chord(monkeypatch):
+    # virsh send-key must hold each chord (--holdtime) so the guest registers it.
+    # without it, fast modifier+key chords race -- shift sticks/drops and the
+    # typed character garbles (a real run mistyped the rescue command and hung).
+    import types
+
+    from raiden_e2e import sendkeys
+
+    calls = []
+    monkeypatch.setattr(
+        sendkeys.subprocess,
+        "run",
+        lambda cmd, **kw: calls.append(cmd) or types.SimpleNamespace(returncode=0),
+    )
+    sendkeys.send_text("vm", "aB")  # a plain key and a shifted one
+    assert calls
+    for cmd in calls:
+        assert "--holdtime" in cmd
+
+
+def test_send_text_paces_between_chords(monkeypatch):
+    # a deliberate gap between keystrokes keeps the guest input pipeline from
+    # dropping characters when send-key fires faster than it can consume them.
+    import time
+
+    from raiden_e2e import sendkeys
+
+    sleeps = []
+    monkeypatch.setattr(sendkeys, "press", lambda vm, *codes: None)
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    sendkeys.send_text("vm", "abc")
+    assert sleeps and all(s > 0 for s in sleeps)
 
 
 def test_default_out_is_timestamped_under_reports():
@@ -118,11 +153,27 @@ def test_default_out_is_timestamped_under_reports():
     )
 
 
-def test_btrfs_has_initramfs_recovery():
+def test_initramfs_recovery_uses_raiden_recover():
+    # the per-stack `mount -o degraded` commands are replaced by one universal
+    # `raiden recover` (baked into the initrd); the follow-through runs it for any
+    # stack that drops to the rescue shell.
     from raiden_e2e.config import INITRAMFS_RECOVERY
 
-    cmds = INITRAMFS_RECOVERY["dm-crypt~btrfs"]
-    assert any("mount -o degraded" in c for c in cmds)
+    assert any("raiden recover" in c for c in INITRAMFS_RECOVERY)
+
+
+def test_array_check_names_are_stack_specific():
+    # doctor names the array/fs health check(s) per stack, so the doctor scenario's
+    # enumeration must expect the right ones (the bug a btrfs run exposed: a hardcoded
+    # 'md array' is absent on btrfs, which reports 'btrfs status'). md stacks emit two
+    # distinct checks now -- 'md boot' and 'md root' (was two 'md array' lines).
+    from raiden_e2e.scenarios import _array_check_names
+
+    assert _array_check_names("dm-crypt~md~lvm~ext4") == ["md boot", "md root"]
+    assert _array_check_names("dm-integrity~md~dm-crypt~lvm~ext4") == ["md boot", "md root"]
+    assert _array_check_names("dm-crypt~zfs") == ["zfs status"]
+    assert _array_check_names("dm-crypt~btrfs") == ["btrfs status"]
+    assert _array_check_names("dm-crypt~bcachefs") == ["fs status"]
 
 
 def test_unlock_prompts_match_keyscript_and_plain_crypttab():

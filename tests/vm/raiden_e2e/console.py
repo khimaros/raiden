@@ -19,6 +19,8 @@ from __future__ import annotations
 import re
 import sys
 
+from .log import strip_control
+
 SHELL_PROMPT = "RAIDEN_SHELL> "
 # the busybox rescue shell prompt shown when the boot cannot mount the root.
 INITRAMFS_PROMPT = r"\(initramfs\) "
@@ -222,7 +224,11 @@ class Console:
         self.child.sendline(f"{cmd}; echo {_MARK}$?{_MARK}")
         self._expect(_RC_RE, timeout=timeout)
         rc = int(self.child.match.group(1))
-        out = self.child.before
+        # strip terminal control sequences (eg. the shell-integration OSC markers
+        # debian's bash emits) so callers parse clean text -- otherwise a device
+        # path like /dev/vda2 comes back wrapped in escapes and string compares,
+        # and the graded report details, are corrupted.
+        out = strip_control(self.child.before or "")
         self._expect(re.escape(SHELL_PROMPT))
         if check and rc != 0:
             raise RuntimeError(f"command failed (rc={rc}): {cmd}\n{out}")

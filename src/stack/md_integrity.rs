@@ -120,6 +120,23 @@ impl Stack for MdIntegrity {
         )
     }
 
+    fn initramfs_binaries(&self) -> Vec<&'static str> {
+        let mut b = super::crypt_initramfs_binaries();
+        b.extend(["mdadm", "lvm", "integritysetup"]);
+        b
+    }
+
+    // integrity devices are opened by udev rules and the single md_root_crypt by
+    // cryptroot in the initramfs, so recovery is the same array+lvm+mount as md~lvm.
+    fn recover_actions(
+        &self,
+        _cfg: &Config,
+        _layout: &Layout,
+        at: &str,
+    ) -> Vec<super::RecoverAction> {
+        super::md_recover_actions(at)
+    }
+
     fn close(&self, _cfg: &Config, layout: &Layout) -> Vec<Step> {
         let mut s = vec![
             Step::run("unmount /mnt", &["umount", "/mnt"]).best_effort(),

@@ -102,12 +102,15 @@ per-run reboot and rescue grades:
 what the grades mean:
 
 - the one operational wart is btrfs: a btrfs root with a faulty member does not
-  boot unattended. it drops to the initramfs and needs a manual `mount -o
-  degraded` before the system comes up (graded WARN). md assembles and zfs imports
-  a degraded array automatically, so every md/zfs/dm-integrity run boots headless
-  after a disk loss. the harness follows the btrfs boot through by running the
-  recovery command itself, which is why it still completes -- but a real headless
-  box would hang at the prompt.
+  boot unattended. it drops to the initramfs and needs a degraded mount before the
+  system comes up (graded WARN). `raiden recover` (baked into the initrd) now
+  provides that as one command -- it runs the `mount -o degraded` for any stack --
+  so the operator no longer has to remember the raw incantation; the harness runs
+  it for the follow-through. md assembles and zfs imports a degraded array
+  automatically, so every md/zfs/dm-integrity run boots headless after a disk loss.
+  recover is still a MANUAL step at the rescue shell, so a real headless box would
+  hang at the prompt until someone runs it -- an automatic local-premount hook
+  (planned) would close that gap.
 - silent-corruption detection differs by stack but all caught it: btrfs and zfs by
   their own checksums, dm-integrity by its crc32c tag, the aead md stacks by the
   crypt layer's authentication plus an md scrub.

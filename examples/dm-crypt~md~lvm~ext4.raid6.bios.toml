@@ -10,10 +10,10 @@ backports = false
 boot_mode = "bios"
 extra_packages = ["vim", "git", "rsync", "screen"]
 serial_console = false
+initramfs_recovery = true
 
 [disks]
 members = ["vda", "vdb", "vdc", "vdd"]
-part_prefix = ""
 
 [raid]
 stack = "dm-crypt~md~lvm~ext4"

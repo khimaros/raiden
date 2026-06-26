@@ -12,10 +12,24 @@ use crate::config::Config;
 
 pub const PATH: &str = "/var/lib/raiden/checkpoint.toml";
 
+/// the checkpoint file location. `RAIDEN_CHECKPOINT` overrides the default, which
+/// lets the e2e tests exercise resume hermetically (and relocates it if needed).
+pub fn path() -> std::path::PathBuf {
+    std::env::var_os("RAIDEN_CHECKPOINT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(PATH))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub operation: String,
     pub config_hash: String,
+    // the operation's destructive scope (eg. replace's disks + layer flags). the
+    // config hash does not capture these cli args, so resume compares them too --
+    // otherwise resuming with different --disks/--parts reuses this cursor against
+    // a different plan and silently skips the wrong steps.
+    #[serde(default)]
+    pub scope: String,
     // index of the last successfully completed step, and the phase it sits in.
     pub phase: usize,
     pub step: usize,
@@ -58,15 +72,17 @@ mod tests {
     fn save_load_clear_roundtrip() {
         let path = std::env::temp_dir().join(format!("raiden-cp-test-{}.toml", std::process::id()));
         let cp = Checkpoint {
-            operation: "install".into(),
+            operation: "replace".into(),
             config_hash: "deadbeef".into(),
+            scope: "disks=vda,vdb esp=true boot=true root=true".into(),
             phase: 3,
             step: 5,
-            phase_name: "format".into(),
+            phase_name: "partition".into(),
         };
         cp.save(&path).unwrap();
         let back = Checkpoint::load(&path).unwrap();
-        assert_eq!(back.operation, "install");
+        assert_eq!(back.operation, "replace");
+        assert_eq!(back.scope, "disks=vda,vdb esp=true boot=true root=true");
         assert_eq!((back.phase, back.step), (3, 5));
         Checkpoint::clear(&path);
         assert!(Checkpoint::load(&path).is_none());

@@ -144,7 +144,7 @@ impl Step {
     }
 
     /// human-readable lines for --dry-run, with the password masked.
-    fn describe(&self) -> Vec<String> {
+    pub fn describe(&self) -> Vec<String> {
         match &self.action {
             Action::Run(r) => {
                 let mut cmd = String::new();
@@ -178,7 +178,10 @@ impl Step {
         }
     }
 
-    fn execute(&self, password: Option<&str>) -> Result<()> {
+    /// run this single step now (no dry-run, no checkpoint). used by the pipeline's
+    /// execute_plan and by `doctor --fix`, which builds an establish step the same
+    /// way install/replace do (parameterized for the running system) and runs it.
+    pub fn execute(&self, password: Option<&str>) -> Result<()> {
         match &self.action {
             Action::Run(r) => run_command(r, password),
             Action::Write {

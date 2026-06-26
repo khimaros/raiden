@@ -61,13 +61,15 @@ pub struct Install {
     // enable a serial console (ttyS0) on the installed system: useful for
     // headless servers and required by the automated vm test harness.
     pub serial_console: bool,
+    // bake the raiden binary + manifest into the initrd so `raiden recover` can
+    // bring a degraded root online from the rescue shell (default on).
+    pub initramfs_recovery: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Disks {
     pub members: Vec<String>,
-    pub part_prefix: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -134,6 +136,7 @@ impl Default for Install {
             boot_mode: "efi".into(),
             extra_packages: Vec::new(),
             serial_console: false,
+            initramfs_recovery: true,
         }
     }
 }

@@ -28,7 +28,8 @@ DEFAULT_IMAGE_BASE = Path.home() / ".local" / "share" / "libvirt" / "images"
 
 # packages the resilience scenarios need on the installed system regardless of
 # what the example config requests. sysbench is only for the benchmark scenario,
-# so it is dropped on a --skip-benchmark run (see render_config with_benchmark).
+# which is off by default, so it is installed only when the benchmark is opted in
+# (see render_config with_benchmark).
 BENCHMARK_PACKAGE = "sysbench"
 TEST_PACKAGES = [BENCHMARK_PACKAGE]
 
@@ -87,14 +88,14 @@ def summarize_config(toml_text: str) -> list[tuple[str, str]]:
 
 
 def render_config(
-    example_path: str, members, level: str = "", boot_raid: bool = False, with_benchmark: bool = True
+    example_path: str, members, level: str = "", boot_raid: bool = False, with_benchmark: bool = False
 ) -> str:
     """load an example config and overlay only the test-specific keys: serial
     console on (the harness drives over serial), the vm's member disks, the raid
     level (only when explicitly chosen), the /boot mode, and the scenario
     packages. stack, cipher, integrity, and filesystem options are unchanged.
-    with_benchmark=False drops sysbench (only the benchmark scenario needs it), so
-    a --skip-benchmark run does not install it."""
+    with_benchmark adds sysbench (only the benchmark scenario needs it); it is off
+    by default, matching the harness's benchmark-off-by-default policy."""
     cfg = tomllib.loads(Path(example_path).read_text())
     install = cfg.setdefault("install", {})
     install["serial_console"] = True
@@ -166,9 +167,9 @@ class VM:
     def _render_config(self) -> str:
         from . import scenarios as sc
 
-        # the benchmark runs only if selected (or in the default bundle when no
-        # subset is chosen); skip its package otherwise.
-        with_benchmark = (not self.cfg.scenarios) or sc.BENCHMARK in self.cfg.scenarios
+        # the benchmark is off by default; its package is installed only when it
+        # is explicitly in the resolved scenarios (--benchmark / --scenario sysbench).
+        with_benchmark = sc.BENCHMARK in self.cfg.scenarios
         return render_config(
             self.cfg.resolved_config_file(),
             self.cfg.disk_names(),

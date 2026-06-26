@@ -61,9 +61,13 @@ pub enum Command {
     Install(InstallArgs),
     /// rebuild specific disks (all layers by default, or only those named)
     Replace {
-        /// comma-separated disks to rebuild
+        /// comma-separated member disks to rebuild (or, with --with, to swap out)
         #[arg(long)]
         disks: String,
+        /// comma-separated new physical disks to swap in (paired with --disks by
+        /// position); omit for an in-place rebuild of --disks
+        #[arg(long)]
+        with: Option<String>,
         /// rebuild the esp (p1) only [default: all layers]
         #[arg(long)]
         esp: bool,
@@ -84,6 +88,8 @@ pub enum Command {
     },
     /// assemble, unlock, and mount from a livecd
     Rescue,
+    /// bring a degraded root online from the initramfs so the boot can continue
+    Recover(RecoverArgs),
     /// ensure the stack is open and mounted (or just /boot + /boot/efi with --boot)
     Mount(MountArgs),
     /// unmount, stop arrays, lock crypt
@@ -94,13 +100,25 @@ pub enum Command {
         #[arg(long)]
         disks: String,
     },
+    /// resync the independent /boot or esp mirrors from the live primary
+    Sync(SyncArgs),
     /// run the fsync-bound fileio benchmark on the array
     Benchmark(BenchmarkArgs),
+    /// check installed-system health (disks, boot, arrays, manifest)
+    Doctor(DoctorArgs),
     /// inspect configuration
     #[command(subcommand)]
     Config(ConfigCmd),
     /// list candidate disks and array members
     Devices,
+}
+
+#[derive(Args)]
+pub struct RecoverArgs {
+    /// directory to mount the recovered root under. defaults to /root, the
+    /// initramfs convention (init expects $rootmnt there); use /mnt from a livecd
+    #[arg(long, default_value = "/root")]
+    pub at: String,
 }
 
 #[derive(Args)]
@@ -140,6 +158,15 @@ pub struct BenchmarkArgs {
 }
 
 #[derive(Args)]
+pub struct DoctorArgs {
+    /// install missing mirror hooks, re-sync drifted mirrors, and re-stamp
+    /// divergent mirror uuids (the legacy-host migration to shared esp/boot
+    /// uuids); confirms each fix unless --yes; pair with --dry-run to preview
+    #[arg(long)]
+    pub fix: bool,
+}
+
+#[derive(Args)]
 pub struct InitArgs {
     /// where to write the config (default: the --config path)
     #[arg(long)]
@@ -166,6 +193,35 @@ pub struct InstallArgs {
     /// list the install phases and exit
     #[arg(long)]
     pub list_phases: bool,
+}
+
+#[derive(Args)]
+pub struct SyncArgs {
+    /// what to sync: the independent /boot mirrors, or the esp mirrors (efi mode)
+    #[command(subcommand)]
+    pub target: SyncTarget,
+}
+
+#[derive(Clone, Subcommand)]
+pub enum SyncTarget {
+    /// resync every member's independent ext4 /boot from the live /boot primary
+    Boot(BootSyncArgs),
+    /// resync every member's esp from the live /boot/efi primary (efi mode)
+    Efi(EfiSyncArgs),
+}
+
+#[derive(Clone, Args)]
+pub struct BootSyncArgs {
+    /// skip the source pre-sync verification (used by no script)
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Clone, Args)]
+pub struct EfiSyncArgs {
+    /// skip the source pre-sync verification (used by no script)
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Subcommand)]

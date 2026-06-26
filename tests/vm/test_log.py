@@ -15,6 +15,15 @@ def test_strip_control_keeps_newlines_and_tabs():
     assert strip_control("a\nb\tc") == "a\nb\tc"
 
 
+def test_strip_control_removes_shell_integration_osc_marker():
+    # debian's bash emits osc 3008 shell-integration markers (terminated by ST,
+    # ESC backslash) around each command. they must be stripped so console.run()
+    # returns clean text -- otherwise a value like a device path comes back
+    # wrapped in the marker and downstream string compares break.
+    s = "\x1b]3008;start=abc;cwd=/root\x1b\\/dev/vda2"
+    assert strip_control(s) == "/dev/vda2"
+
+
 def test_cleanstream_line_buffers_split_escape_sequence():
     buf = io.StringIO()
     cs = CleanStream(buf)

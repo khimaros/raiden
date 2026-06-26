@@ -17,12 +17,14 @@ extra_packages = ["vim", "git", "rsync", "screen"]
 # enable a serial console (ttyS0) on the installed system. useful for headless
 # servers and required by the automated vm test harness.
 serial_console = false
+# bake the raiden binary + manifest into the initrd so `raiden recover` can bring
+# a degraded root online from the initramfs rescue shell.
+initramfs_recovery = true
 
 [disks]
 # explicit list of member disks (no glob/eval). a stable id under /dev is fine.
 members = ["vda", "vdb", "vdc", "vdd"]
 # partition name prefix; usually "p" for nvme, empty otherwise
-part_prefix = ""
 
 [raid]
 # stack identifier, one of:

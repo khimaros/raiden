@@ -5,8 +5,8 @@
 
 use crate::config::Config;
 use crate::layout::{Layout, BOOT_MD_DEVICE, BOOT_MD_NAME, ESP_MOUNT};
+use crate::manifest::Manifest;
 use crate::stack::{self, Stack};
-use crate::state::State;
 use crate::step::{Phase, Step};
 
 pub const APT: &str = "apt";
@@ -27,7 +27,7 @@ pub const PHASES: &[&str] = &[
 ];
 
 // vfat mount options for every esp, matching what grub-install would write.
-const EFI_OPTS: &str =
+pub const EFI_OPTS: &str =
     "rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro";
 
 // where the raiden binary is staged in the installed system, so post-install ops
@@ -74,19 +74,19 @@ fn finish_phase(
     raiden_bin: Option<&str>,
 ) -> Phase {
     let mut s = stack.finish(cfg, layout);
-    let manifest = State::from_config(cfg).to_toml();
+    let manifest = Manifest::from_config(cfg).to_toml();
     s.push(Step::run(
-        "create the raiden state dirs in the target",
+        "create the raiden manifest dirs in the target",
         &["mkdir", "-p", "/mnt/etc/raiden", "/mnt/boot/raiden"],
     ));
     s.push(Step::write(
         "write the install manifest",
-        "/mnt/etc/raiden/state.toml",
+        "/mnt/etc/raiden/manifest.toml",
         manifest.clone(),
     ));
     s.push(Step::write(
         "mirror the manifest to /boot",
-        "/mnt/boot/raiden/state.toml",
+        "/mnt/boot/raiden/manifest.toml",
         manifest,
     ));
     // stage the running binary alongside the manifest, so the post-install ops
@@ -106,11 +106,35 @@ fn finish_phase(
             ],
         ));
     }
+    // bake raiden + the manifest into the initrd so `raiden recover` is available
+    // at the rescue shell (default on). the binary + manifest are now staged, so
+    // install the hook and rebuild the initrd once more to fold them in -- the
+    // first build (stack.finish) made the crypttab-aware initrd; this adds recovery.
+    if cfg.install.initramfs_recovery {
+        s.push(stack::raiden_recovery_hook_step("/mnt"));
+        s.push(stack::update_initramfs_u(true));
+    }
     // independent /boot: with the final initrd and the manifest now in /boot, push
     // them to every mirror so a survivor boots an identical, working /boot.
     if !layout.boot_raid() {
-        s.push(boot_mirror_sync_step());
+        s.push(boot_sync_step());
     }
+    // efi: the grub.d hook no-ops at install (raiden is staged only now, after the
+    // bootloader phase's update-grub ran it), so sync the esps explicitly here.
+    // esp mirroring applies in efi mode regardless of boot.raid (esps are always
+    // per-disk independent).
+    let efi = cfg.install.boot_mode == "efi";
+    if efi {
+        s.push(efi_sync_step());
+    }
+    // postcondition: every member esp/boot must independently carry its bootloader
+    // (the sync above just populated them), so a survivor can boot when the shared
+    // uuid mounts /boot/efi or /boot from it. fails the install loudly otherwise.
+    s.extend(crate::ops::verify_bootloaders(
+        layout,
+        efi,
+        !layout.boot_raid(),
+    ));
     Phase::new(FINISH, s)
 }
 
@@ -264,18 +288,32 @@ pub fn format_phase(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Phase {
         s.extend(format_boot_independent(&boot));
     }
     if cfg.install.boot_mode == "efi" {
-        for dev in layout.esp_devices() {
-            s.push(Step::run_owned(
-                format!("format esp {dev}"),
-                strs(&["mkfs.msdos", "-F", "32", "-s", "1", "-n", "EFI"])
-                    .into_iter()
-                    .chain([dev])
-                    .collect(),
-            ));
-        }
+        s.extend(format_esp_independent(&layout.esp_devices()));
     }
     s.extend(stack.format_root(cfg, layout));
     Phase::new(FORMAT, s)
+}
+
+/// format each member's esp as an independent vfat filesystem, all sharing the
+/// first member's fs uuid so /boot/efi (mounted by that uuid) can fall through
+/// to any survivor if the primary esp is lost -- mirroring the /boot design.
+/// firmware boot is unaffected: efibootmgr targets disk+partition, not uuid.
+fn format_esp_independent(esp: &[String]) -> Vec<Step> {
+    let src = esp[0].clone();
+    let mut s = vec![Step::run_owned(
+        format!("format {src} as vfat (esp)"),
+        crate::efi::mkfs_esp_argv(&src, None),
+    )];
+    s.extend(esp[1..].iter().map(|dev| {
+        Step::sh(
+            format!("format {dev} as vfat sharing the esp uuid"),
+            format!(
+                "u=$(blkid -s UUID -o value {src} | tr -d -); {}",
+                crate::efi::mkfs_esp_argv(dev, Some("$u")).join(" ")
+            ),
+        )
+    }));
+    s
 }
 
 /// format each member's boot partition as an independent ext4 /boot, all sharing
@@ -481,6 +519,22 @@ pub fn bootloader_phase(cfg: &Config, layout: &Layout) -> Phase {
     if efi || !layout.boot_raid() {
         pkgs.push("rsync".to_string());
     }
+    if efi {
+        // preseed grub-efi-amd64's postinst (this install AND future grub upgrades):
+        // force_efi_extra_removable keeps the EFI/BOOT fallback re-written alongside
+        // the named EFI/debian install. update_nvram is OFF: raiden owns the nvram
+        // boot entries -- it registers one per-disk shim entry via efibootmgr itself
+        // (reverse order at install, repopulated on replace, reconciled by `doctor
+        // --fix`), so letting grub's postinst also add entries on every upgrade only
+        // accumulates duplicate/shim-bypassing cruft.
+        s.push(Step::sh(
+            "preseed grub-efi-amd64 debconf (removable fallback on; grub nvram off)",
+            format!(
+                "printf '{}' | chroot /mnt debconf-set-selections",
+                crate::efi::grub_debconf_selections()
+            ),
+        ));
+    }
     s.push(apt_install("install grub + mirror packages in target", &pkgs).chroot());
     s.push(boot_fstab_step(layout));
     if efi {
@@ -521,20 +575,42 @@ pub fn bootloader_phase(cfg: &Config, layout: &Layout) -> Phase {
     }
     s.push(Step::run("regenerate grub config", &["update-grub"]).chroot());
     // the initial boot-mirror content sync happens in the finish phase, after the
-    // crypttab-aware initrd is built -- see boot_mirror_sync_step.
+    // crypttab-aware initrd is built -- see boot_sync_step.
     Phase::new(BOOTLOADER, s)
 }
 
-/// strict one-shot sync of the boot mirrors. used at install time after the final
-/// initrd exists; the kernel hooks handle later updates. an earlier sync (before
+/// one-shot sync of the boot mirrors. used at install time after the final initrd
+/// exists; the kernel hooks handle later updates. an earlier sync (before
 /// update-initramfs) would ship a cryptsetup-less initrd, so a survivor booted
-/// after the primary's /boot is lost could not unlock the encrypted root.
-fn boot_mirror_sync_step() -> Step {
+/// after the primary's /boot is lost could not unlock the encrypted root. --yes
+/// skips the (absent here) confirmation. invoked by absolute path: a chroot
+/// inherits the livecd's PATH, which does not include /usr/local/sbin where
+/// raiden is staged in the target.
+fn boot_sync_step() -> Step {
     Step::run_owned(
         "sync the boot mirrors",
         vec![
-            stack::BOOT_MIRROR_SYNC_PATH.to_string(),
-            "--strict".to_string(),
+            RAIDEN_TARGET_BIN.to_string(),
+            "sync".to_string(),
+            "boot".to_string(),
+            "--yes".to_string(),
+        ],
+    )
+    .chroot()
+}
+
+/// one-shot sync of the esp mirrors at install time. the grub.d hook runs during
+/// the bootloader phase's update-grub, before raiden is staged into the target,
+/// so it no-ops then; this finish-phase call (after staging) does the real sync.
+/// invoked by absolute path (see boot_sync_step).
+fn efi_sync_step() -> Step {
+    Step::run_owned(
+        "sync the esp mirrors",
+        vec![
+            RAIDEN_TARGET_BIN.to_string(),
+            "sync".to_string(),
+            "efi".to_string(),
+            "--yes".to_string(),
         ],
     )
     .chroot()
@@ -561,39 +637,32 @@ fn boot_fstab_step(layout: &Layout) -> Step {
     }
 }
 
-/// independent /boot: install the member-driven sync script and its kernel hooks.
-/// the mirrors have no fstab entry -- the script mounts each physical disk's /boot
-/// transiently under /run/raiden to resync (the live /boot uses the shared uuid).
-fn boot_mirror_install_steps(layout: &Layout) -> Vec<Step> {
-    // the script and hook dirs exist in a base install, but mkdir -p keeps this
-    // robust (Step::write does not create parent dirs).
+/// independent /boot: install the boot-mirror kernel hooks. the sync logic
+/// itself lives in `raiden sync boot` (staged earlier at /usr/local/sbin/raiden);
+/// the hooks are inline scripts that exec it with --yes so an unattended kernel
+/// upgrade never prompts. the mirrors have no fstab entry -- `sync boot` mounts
+/// each physical disk's /boot transiently under /run/raiden to resync (the live
+/// /boot uses the shared uuid).
+fn boot_mirror_install_steps(_layout: &Layout) -> Vec<Step> {
+    // the hook dirs exist in a base install, but mkdir -p keeps this robust
+    // (Step::write does not create parent dirs).
     let mut s = vec![Step::run(
-        "create the boot mirror script and hook dirs",
+        "create the boot mirror hook dirs",
         &[
             "mkdir",
             "-p",
-            "/mnt/usr/local/sbin",
             "/mnt/etc/kernel/postinst.d",
             "/mnt/etc/kernel/postrm.d",
         ],
     )];
-    s.push(Step::write_mode(
-        "install the boot mirror sync script",
-        format!("/mnt{}", stack::BOOT_MIRROR_SYNC_PATH),
-        stack::boot_mirror_sync(&layout.boot_devices()),
-        0o755,
-    ));
     // the hooks run after zz-update-grub, so each new kernel/initrd and the
     // regenerated grub.cfg reach every disk's /boot.
     for dir in ["postinst.d", "postrm.d"] {
-        s.push(Step::run_owned(
+        s.push(Step::write_mode(
             format!("hook the boot mirror sync into kernel {dir}"),
-            vec![
-                "ln".to_string(),
-                "-sfn".to_string(),
-                stack::BOOT_MIRROR_SYNC_PATH.to_string(),
-                format!("/mnt/etc/kernel/{dir}/{}", stack::BOOT_MIRROR_HOOK_NAME),
-            ],
+            format!("/mnt/etc/kernel/{dir}/{}", stack::BOOT_MIRROR_HOOK_NAME),
+            stack::BOOT_MIRROR_HOOK_CONTENT,
+            0o755,
         ));
     }
     s
@@ -621,38 +690,15 @@ fn serial_console_steps() -> Vec<Step> {
 }
 
 fn bootloader_efi(layout: &Layout) -> Vec<Step> {
-    let mut s = vec![Step::run(
-        "install grub to the esp",
-        &[
-            "grub-install",
-            "--target=x86_64-efi",
-            "--bootloader-id=debian",
-            "--efi-directory=/boot/efi",
-            "--no-nvram",
-            "--recheck",
-            "--no-floppy",
-            "--removable",
-        ],
-    )
-    .chroot()];
+    // grub-install in both modes (named EFI/debian + removable EFI/BOOT fallback),
+    // in the chroot; shared with doctor's grub fix via crate::efi.
+    let mut s = crate::efi::grub_install_steps(true);
     // reverse order so the first disk ends up first in the firmware boot menu.
     for d in layout.members.iter().rev() {
         s.push(
             Step::run_owned(
                 format!("register efi boot entry for {d}"),
-                vec![
-                    "efibootmgr".to_string(),
-                    "-c".to_string(),
-                    "-g".to_string(),
-                    "-d".to_string(),
-                    format!("/dev/{d}"),
-                    "-p".to_string(),
-                    "1".to_string(),
-                    "-L".to_string(),
-                    format!("debian-{d}"),
-                    "-l".to_string(),
-                    r"\EFI\debian\shimx64.efi".to_string(),
-                ],
+                crate::efi::register_argv(d),
             )
             .chroot(),
         );
@@ -660,16 +706,17 @@ fn bootloader_efi(layout: &Layout) -> Vec<Step> {
     s.extend(esp_fstab_steps(layout));
     s.push(Step::write_mode(
         "install the esp mirror grub.d hook",
-        "/mnt/etc/grub.d/90_copy_to_efi_mirrors",
-        stack::efi_mirror_hook(&layout.esp_devices()),
+        stack::EFI_MIRROR_HOOK_PATH,
+        stack::EFI_MIRROR_WRAPPER,
         0o755,
     ));
     s
 }
 
-/// the single esp fstab entry: the primary member's esp at /boot/efi by uuid
-/// (nofail). the other members' esps are mirrors with no fstab entry -- the
-/// grub.d hook mounts them transiently under /run/raiden to resync.
+/// the single esp fstab entry: /boot/efi mounted by the shared esp uuid
+/// (nofail). every member's esp carries that uuid, so the entry resolves to any
+/// survivor if the primary is lost. the other members are still mirrors with no
+/// persistent mount point -- the grub.d hook mounts them transiently to resync.
 fn esp_fstab_steps(layout: &Layout) -> Vec<Step> {
     let Some(primary) = layout.esp_devices().into_iter().next() else {
         return Vec::new();

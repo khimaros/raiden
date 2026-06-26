@@ -50,22 +50,13 @@ EXAMPLE_CONFIG = {
     "dm-integrity~md~dm-crypt~lvm~ext4": "dm-integrity~md~dm-crypt~lvm~ext4.raid6.toml",
 }
 
-# shell commands that recover a boot which drops to the initramfs rescue shell,
-# keyed by stack. btrfs refuses to mount a multi-device root when a member is
-# faulty (after the corruption/truncate scenarios), so the degraded array boots
-# only with a manual `mount -o degraded` from a surviving member, then exit.
-INITRAMFS_RECOVERY = {
-    "dm-crypt~btrfs": [
-        "btrfs device scan",
-        'for d in /dev/mapper/*_crypt; do mount -o degraded "$d" /root 2>/dev/null && break; done',
-    ],
-    # bcachefs, like btrfs, refuses a multi-device mount with a faulty member and
-    # needs a manual degraded mount from a surviving crypt device.
-    "dm-crypt~bcachefs": [
-        "bcachefs device scan 2>/dev/null || true",
-        'for d in /dev/mapper/*_crypt; do mount -t bcachefs -o degraded "$d" /root 2>/dev/null && break; done',
-    ],
-}
+# shell command that recovers a boot which drops to the initramfs rescue shell.
+# `raiden recover` (baked into the initrd by install.initramfs_recovery) brings a
+# degraded root online for any stack, generalizing the old per-stack `mount -o
+# degraded` commands; it is a no-op when the root is already mounted, so it is
+# harmless for stacks (md/zfs) that assemble degraded on their own. invoked by
+# absolute path -- the hook copies the binary to /sbin/raiden in the initrd.
+INITRAMFS_RECOVERY = ["/sbin/raiden recover --yes"]
 
 
 @dataclass

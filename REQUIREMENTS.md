@@ -27,13 +27,14 @@ it is never okay to regress on a "must not regress" requirement in a release.
   - btrfs: raid0, raid1, raid1c2, raid1c3, raid1c4, raid5, raid6, raid10
 - R5. EFI and BIOS boot. for EFI, every disk gets an independent, bootable ESP
   (grub-install --removable plus a per-disk firmware boot entry), so the firmware
-  can boot from any survivor. the first member's ESP is mounted at /boot/efi (by
-  UUID, nofail); the others are mirrors with no persistent mount point, resynced
-  from it by a grub.d hook on each update-grub via transient mounts under
-  /run/raiden. `nofail` keeps a lost disk from blocking boot. a lost primary is
-  recovered by `raiden replace` (rebuilds it in place, preserving the ESP UUID so
-  /boot/efi returns); a surviving ESP can be mounted at /boot/efi to keep the
-  system serviceable until then.
+  can boot from any survivor. every ESP shares one vfat fs UUID (like /boot), so
+  /boot/efi (mounted by that UUID, nofail) resolves to any survivor's ESP; the
+  non-primary ESPs have no persistent mount point and are resynced from the live
+  /boot/efi by a grub.d hook on each update-grub via transient mounts under
+  /run/raiden. `nofail` keeps a lost disk from blocking boot, and losing the first
+  member no longer drops /boot/efi (a survivor's ESP carries the same UUID).
+  `raiden replace` re-stamps the shared ESP UUID onto a rebuilt disk so its ESP
+  rejoins the set.
 - R6. /boot: by default each disk carries an independent ext4 /boot, all sharing
   one fs UUID, so every disk's grub finds its own local /boot and first-disk loss
   still boots (no array to assemble). the non-primary copies have no persistent
@@ -44,10 +45,11 @@ it is never okay to regress on a "must not regress" requirement in a release.
 - R7. per-disk partition layout: p1 ESP (efi) or bios-boot, p2 /boot (independent
   ext4, or an md member when boot.raid), p3 root (crypt or integrity).
 - R8. crypttab and fstab reference devices by UUID so device reordering is safe
-  (the live /boot and the primary ESP mount by UUID). the mirror targets -- the
-  other disks' /boot and ESP copies -- are addressed by member device, since the
-  /boot copies share one UUID and the sync must write each specific disk; they are
-  mounted only transiently during the sync, never persistently.
+  (the live /boot and /boot/efi mount by UUID). the mirror targets -- the other
+  disks' /boot and ESP copies -- are addressed by member device, since each set
+  shares one UUID (so it cannot address a specific disk) and the sync must write
+  each specific disk; they are mounted only transiently during the sync, never
+  persistently.
 - R9. back up luks headers to /boot for disaster recovery.
 - R10. prompt for the encryption password once, verify it, never write it to
   disk or logs.
@@ -73,10 +75,12 @@ it is never okay to regress on a "must not regress" requirement in a release.
 
 - N1. TOML config file with flag overrides. precedence, lowest to highest:
   built-in defaults, config file, environment, command line flags.
-- N2. persist an install manifest (`/etc/raiden/state.toml`, mirrored to /boot)
-  recording the resolved stack, level, members, and the partition/luks/esp UUIDs
-  chosen at install. `status`, `scrub`, `rescue`, `replace`, and `close` resolve
-  from the manifest, so post-install operations need no hand-maintained config.
+- N2. persist an install manifest (`/boot/raiden/manifest.toml`, canonical,
+  mirrored to `/etc/raiden/manifest.toml`) recording the resolved stack, level,
+  members, and the partition/luks/esp UUIDs chosen at install. /boot is canonical
+  so a livecd can read it without unlocking the root fs. `status`, `scrub`,
+  `rescue`, `replace`, and `close` resolve from the manifest, so post-install
+  operations need no hand-maintained config.
 - N3. `--dry-run` prints the exact commands that would run; `config validate`
   checks a config without touching disks.
 - N4. type-safe stack dispatch and config validation replace bash convention and
@@ -90,8 +94,8 @@ it is never okay to regress on a "must not regress" requirement in a release.
 - N8. an automated libvirt vm test harness that installs and runs the
   resilience/repair scenarios over the serial console with no human in the loop
   and no timers, grading each result into a report. it follows through a boot that
-  drops to the initramfs rescue shell by running per-stack recovery commands and
-  resuming -- required by btrfs, whose multi-device root needs a manual
+  drops to the initramfs rescue shell by running `raiden recover` (see N11) and
+  resuming -- required by btrfs/bcachefs, whose multi-device root needs
   `mount -o degraded` when a member is faulty (md and zfs assemble degraded
   automatically).
 - N9. a per-stack example config catalog (`examples/`) of complete, valid
@@ -105,6 +109,16 @@ it is never okay to regress on a "must not regress" requirement in a release.
   replica count). a stack may declare extra apt repositories it needs beyond
   Debian's (eg. an out-of-tree dkms module): bcachefs adds apt.bcachefs.org for
   its kernel module and tools.
+- N11. `raiden recover`: bring a degraded root online from the initramfs rescue
+  shell so the boot can continue, generalizing the per-stack manual
+  `mount -o degraded` commands into one command. structured as check/fix (mount
+  the root only if not already mounted; confirm each action unless `--yes`); crypt
+  members are already open by the initramfs, so it assembles/imports and mounts
+  (degraded/forced) at `$rootmnt`. raiden + the manifest are baked into the initrd
+  (config-guarded `install.initramfs_recovery`, default on) via a raiden initramfs
+  hook so the command exists at the rescue shell. doctor verifies the bake and
+  `doctor --fix` installs the hook (the legacy-host migration). automatic recovery
+  (a local-premount hook) is future work; the manual command is the first step.
 
 ## non-goals
 
