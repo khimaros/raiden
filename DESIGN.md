@@ -288,8 +288,9 @@ doctor's `--fix` establish the bundle through the SAME shared steps
 (`stack::raiden_recovery_hook_step` parameterized by root, `stack::
 update_initramfs_u` parameterized by chroot), so the establish and the verify
 cannot drift. doctor checks both halves when the feature is on: `recover hook` (the
-hook is installed + executable, so a future rebuild keeps baking raiden in -- a
-removed hook would silently drop it, like the mirror hooks) and `recover` (the
+hook is installed, executable, and current, so a future rebuild keeps baking raiden
+in -- a removed, unmode, or stale hook would silently drop it or bake an old one,
+like the mirror hooks) and `recover` (the
 initrd currently carries raiden + the manifest).
 
 ## password and serial console
@@ -324,8 +325,12 @@ survivor), the initrd
 decrypt_keyctl keyscript + keyctl, cryptsetup, and the stack's assemble/mount tools
 -- the per-stack list from Stack::initramfs_binaries, the same source an install
 postcondition can use), the boot-mirror kernel hooks (postinst.d/postrm.d) AND the esp-mirror
-grub.d hook (both checked for presence AND the executable bit, since run-parts and
-grub-mkconfig silently skip non-executable scripts), the per-disk efibootmgr
+grub.d hook (each checked for presence, the executable bit -- run-parts and
+grub-mkconfig silently skip non-executable scripts -- AND content currency: a hook
+left by an older raiden whose body no longer matches the canonical constant is
+flagged out of date, since a stale hook can actively break upgrades, e.g. the old
+boot hook that forwarded run-parts' args to `sync boot` and wedged kernel
+installs), the per-disk efibootmgr
 entries (each member should have exactly one boot entry loading shim from its own
 esp, matched by the esp PARTUUID -- distinct from the fs uuid, so a uuid re-stamp
 needs no efibootmgr change -- with duplicate/shim-bypassing-grub cruft flagged),
@@ -343,8 +348,10 @@ untouched.
 
 `--fix` repairs the auto-fixable checks in place: it installs the boot-mirror
 kernel hooks and the esp-mirror grub.d hook (the static wrapper content from
-`stack::BOOT_MIRROR_HOOK_CONTENT` / `EFI_MIRROR_WRAPPER`, 0755) when missing or
-non-executable, re-runs `raiden sync boot`/`sync efi` to repair drifted mirrors,
+`stack::BOOT_MIRROR_HOOK_CONTENT` / `EFI_MIRROR_WRAPPER`, 0755) when missing,
+non-executable, or out of date -- the re-install overwrites with the current
+content, so the same fix that adds a missing hook also refreshes a stale one,
+re-runs `raiden sync boot`/`sync efi` to repair drifted mirrors,
 and re-stamps any mirror whose fs uuid diverges from the shared one (the
 legacy-host migration to shared esp/boot uuids -- `raiden doctor --fix` brings an
 older install up to spec). the re-stamp is a reconcile: it re-observes live state

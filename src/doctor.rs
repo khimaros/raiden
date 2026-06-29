@@ -1221,13 +1221,15 @@ fn check_initrd(stack: &dyn stack::Stack, recover_bundle: bool) -> Vec<Check> {
     };
     if recover_bundle {
         // the raiden initramfs hook is the establish mechanism: it bakes raiden +
-        // the manifest into the initrd. check it is installed + executable, so a
-        // FUTURE rebuild keeps baking them in -- a removed/non-executable hook would
-        // silently drop raiden on the next update-initramfs, which the initrd-content
-        // check below (current state) cannot foresee. matches the mirror-hook checks.
+        // the manifest into the initrd. check it is installed, executable, and
+        // current, so a FUTURE rebuild keeps baking them in -- a removed, unmode, or
+        // stale hook would silently drop raiden (or bake a stale one) on the next
+        // update-initramfs, which the initrd-content check below (current state)
+        // cannot foresee. matches the mirror-hook checks.
         out.push(check_executable_hook(
             "recover hook",
             stack::RAIDEN_RECOVERY_HOOK,
+            stack::INITRAMFS_HOOK_RAIDEN,
             Fix::RecoverBundle,
         ));
         // and that the initrd currently carries raiden + the manifest. unlike the
@@ -1254,9 +1256,10 @@ fn missing_initrd_binaries(listing: &str, required: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// the boot-mirror kernel hooks (postinst.d/postrm.d) are installed and
-/// executable. run-parts skips a non-executable hook, so a present-but-unmode
-/// file is a silent failure -- same fix as a missing one (re-install).
+/// the boot-mirror kernel hooks (postinst.d/postrm.d) are installed, executable,
+/// and current. run-parts skips a non-executable hook, so a present-but-unmode
+/// file is a silent failure; a stale hook from an older raiden actively breaks
+/// kernel upgrades -- all take the same fix (re-install the current content).
 fn check_kernel_hooks() -> Vec<Check> {
     let hook = stack::BOOT_MIRROR_HOOK_NAME;
     let mut out = Vec::new();
@@ -1265,6 +1268,7 @@ fn check_kernel_hooks() -> Vec<Check> {
         out.push(check_executable_hook(
             "kernel hooks",
             &path,
+            stack::BOOT_MIRROR_HOOK_CONTENT,
             Fix::BootHook(dir),
         ));
     }
@@ -1276,26 +1280,38 @@ fn check_efi_hook() -> Vec<Check> {
     vec![check_executable_hook(
         "esp hook",
         &efi_hook_path(),
+        stack::EFI_MIRROR_WRAPPER,
         Fix::EfiHook,
     )]
 }
 
-/// a mirror hook must exist and be executable: run-parts (kernel postinst.d) and
-/// grub-mkconfig (grub.d) both skip non-executable scripts. a missing or unmode
-/// hook takes the same fix (re-install, which sets 0755).
-fn check_executable_hook(name: &'static str, path: &str, fix: Fix) -> Check {
+/// a mirror hook must exist, be executable, AND carry this raiden's canonical
+/// content. run-parts (kernel postinst.d) and grub-mkconfig (grub.d) both skip a
+/// non-executable script, and a STALE hook left by an older raiden can actively
+/// break upgrades (e.g. an old boot hook that forwarded run-parts' positional args
+/// to `raiden sync boot`, which clap rejects -- failing the hook and blocking the
+/// kernel upgrade). a missing, unmode, or out-of-date hook all take the same fix:
+/// re-install, which overwrites with the current content at 0755.
+fn check_executable_hook(name: &'static str, path: &str, expected: &str, fix: Fix) -> Check {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
         Err(_) => return Check::warn(name, format!("{path} missing")).with_fix(fix),
     };
-    if meta.permissions().mode() & 0o111 != 0 {
-        Check::ok(name, format!("{path} present, executable"))
-    } else {
-        Check::warn(
+    if meta.permissions().mode() & 0o111 == 0 {
+        return Check::warn(
             name,
             format!("{path} not executable (run-parts would skip it)"),
         )
-        .with_fix(fix)
+        .with_fix(fix);
+    }
+    match fs::read_to_string(path) {
+        Ok(c) if c == expected => Check::ok(name, format!("{path} present, executable, current")),
+        Ok(_) => Check::warn(
+            name,
+            format!("{path} out of date (content differs from this raiden)"),
+        )
+        .with_fix(fix),
+        Err(_) => Check::warn(name, format!("{path} unreadable")).with_fix(fix),
     }
 }
 
@@ -1619,30 +1635,51 @@ mod tests {
         );
     }
 
+    // a hook is only ok when it is present, executable, AND its content matches
+    // this raiden's canonical text. missing, non-executable, and stale-content all
+    // warn with the same re-install fix -- a stale hook (e.g. the old boot hook that
+    // forwarded run-parts' args) silently passes presence/exec checks yet still
+    // breaks upgrades, so doctor must notice the content drift too.
     #[test]
-    fn executable_hook_passes_missing_and_unmode_warn_with_fix() {
+    fn executable_hook_warns_unless_present_executable_and_current() {
+        let expected = "#!/bin/sh\ncanonical\n";
         let dir = std::env::temp_dir().join(format!("raiden-hook-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        let exec_write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            fs::write(&p, body).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
 
         // missing -> warn + fix.
         let missing = dir.join("missing");
-        let c = check_executable_hook("esp hook", missing.to_str().unwrap(), Fix::EfiHook);
+        let c = check_executable_hook(
+            "esp hook",
+            missing.to_str().unwrap(),
+            expected,
+            Fix::EfiHook,
+        );
         assert_eq!(c.status, WARN);
         assert!(c.fix.is_some());
 
         // present but not executable -> warn + fix (run-parts would skip it).
         let unmode = dir.join("unmode");
-        fs::write(&unmode, "#!/bin/sh\n").unwrap();
-        let c = check_executable_hook("esp hook", unmode.to_str().unwrap(), Fix::EfiHook);
+        fs::write(&unmode, expected).unwrap();
+        let c = check_executable_hook("esp hook", unmode.to_str().unwrap(), expected, Fix::EfiHook);
         assert_eq!(c.status, WARN);
         assert!(c.fix.is_some());
 
-        // present and executable -> ok.
-        let exec = dir.join("exec");
-        fs::write(&exec, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&exec, fs::Permissions::from_mode(0o755)).unwrap();
-        let c = check_executable_hook("esp hook", exec.to_str().unwrap(), Fix::EfiHook);
+        // present + executable but STALE content -> warn + fix (the regression).
+        let stale = exec_write("stale", "#!/bin/sh\nexec raiden sync efi --yes \"$@\"\n");
+        let c = check_executable_hook("esp hook", stale.to_str().unwrap(), expected, Fix::EfiHook);
+        assert_eq!(c.status, WARN);
+        assert!(c.fix.is_some());
+
+        // present, executable, content matches the canonical text -> ok, no fix.
+        let exec = exec_write("exec", expected);
+        let c = check_executable_hook("esp hook", exec.to_str().unwrap(), expected, Fix::EfiHook);
         assert_eq!(c.status, OK);
         assert!(c.fix.is_none());
 

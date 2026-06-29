@@ -273,12 +273,12 @@ def sync_mirrors(s: Session) -> None:
     if s.cfg.boot_raid:
         s.report.add(scen, "sync", INFO, "skipped: boot.raid (mdadm replicates /boot)")
         return
-    # dry-run resolves the source + mirrors without touching disks.
+    # dry-run resolves the primary + mirrors without touching disks.
     rc, out = s.raiden_check("sync boot --dry-run")
-    ok = "source:" in out and "mirrors:" in out and "rsync" in out
+    ok = "primary:" in out and "mirrors:" in out and "rsync" in out
     s.report.add(scen, "boot dry-run", PASS if ok else FAIL, _tail(out))
     rc, out = s.raiden_check("sync efi --dry-run")
-    ok = "source:" in out and "mirrors:" in out and "rsync" in out
+    ok = "primary:" in out and "mirrors:" in out and "rsync" in out
     s.report.add(scen, "efi dry-run", PASS if ok else FAIL, _tail(out))
     # a real sync of both, with verification on (default).
     _, out = s.raiden_check("sync boot --yes")
@@ -346,6 +346,28 @@ def doctor_fix(s: Session) -> None:
         rc, out = s.c.run(f"test -x {hook} && echo REINSTALLED", timeout=30)
         ok = rc == 0 and "REINSTALLED" in out
         s.report.add(scen, "hook reinstall", PASS if ok else FAIL, _tail(out))
+
+        # a STALE hook left by an older raiden -- present + executable but out of
+        # date: the legacy forward-"$@" boot hook, which run-parts feeds the kernel
+        # version, so `sync boot` (no positional) rejects it and the exit-code-
+        # propagating hook blocks every kernel upgrade. doctor must flag the content
+        # drift (not just presence) and --fix must rewrite it to the current shim.
+        s.c.run(
+            f"printf '#!/bin/sh\\nexec /usr/local/sbin/raiden sync boot --yes \"$@\"\\n'"
+            f" > {hook} && chmod 0755 {hook}",
+            check=True,
+        )
+        _, out = s.raiden("doctor")  # out-of-date hook is a warn -> rc stays 0
+        detected = "kernel hooks" in out and "out of date" in out
+        s.report.add(scen, "hook stale detect", PASS if detected else FAIL, _tail(out))
+        s.raiden("doctor --fix --yes")
+        # rewritten to the no-args shim: still invokes sync boot, no longer forwards
+        # run-parts' positional args (the breakage this closes).
+        rc, out = s.c.run(
+            f'grep -q -- "sync boot --yes$" {hook} && echo REWRITTEN', timeout=30
+        )
+        ok = rc == 0 and "REWRITTEN" in out
+        s.report.add(scen, "hook stale fix", PASS if ok else FAIL, _tail(out))
 
     # -- the recover bundle: the raiden recovery hook bakes raiden + the manifest
     # into the initrd. remove it and rebuild so the initrd loses them (the legacy-

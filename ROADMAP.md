@@ -822,3 +822,34 @@
     first step). safety stance on degraded auto-mount: ro first, log loudly, maybe
     only after a retry -- btrfs/bcachefs refuse degraded by design to avoid
     divergence, so an unattended degraded rw mount is the risk to guard.
+
+[x] doctor: detect and fix OUT-OF-DATE hooks, not just missing/non-executable
+    ones. the hook checks (kernel boot-mirror postinst.d/postrm.d, esp grub.d,
+    recover initramfs) only verified presence + the exec bit, so a STALE hook left
+    by an older raiden passed even when its content no longer matched this version.
+    that is exactly how the forward-"$@" boot hook (fixed in source) kept breaking
+    kernel upgrades on already-installed hosts: the source shim was corrected but
+    the host still carried the old script, and doctor reported it OK. fixed:
+    check_executable_hook now also compares the installed hook against its canonical
+    content constant (BOOT_MIRROR_HOOK_CONTENT / EFI_MIRROR_WRAPPER /
+    INITRAMFS_HOOK_RAIDEN) and warns "out of date" + re-installs when it drifts --
+    the existing per-hook fix already overwrites with the current content, so no new
+    fix machinery was needed. guarded by a unit test (executable_hook_warns_unless_
+    present_executable_and_current) and a doctor_fix vm scenario that plants the
+    legacy forward-"$@" boot hook and asserts --fix rewrites it to the no-args shim.
+
+[x] sync: log the mirror step from raiden itself, not the hook scripts. the
+    kernel/grub.d hooks stay thin shims (no echo of their own); `raiden sync`
+    already announced the resolved devices, so this just relabels them to name
+    which is the live primary and which are its mirrors and prepends the operation
+    ("mirroring /boot"). a single, consistent log across every invocation path
+    (hook, install finish, doctor --fix, manual) instead of a per-hook echo that
+    would duplicate it. the esp grub.d wrapper keeps `exec 1>&2` so this output
+    stays out of grub.cfg. sync_mirrors vm scenario asserts the new "primary:" label.
+
+[x] recover hook: announce the initramfs bake. the raiden recovery initramfs hook
+    does its work directly (copy_exec/cp), not through a raiden subcommand, so
+    update-initramfs printed nothing about raiden being baked into the initrd.
+    added an echo (to stderr, after the prereqs early-exit so it fires once on the
+    real run, not the ordering query) describing the bake. guarded by a unit test
+    (recovery_hook_announces_only_on_the_real_run).

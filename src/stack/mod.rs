@@ -138,7 +138,9 @@ pub fn select(id: &str) -> Result<Box<dyn Stack>> {
 // would be worse than a stale mirror (run `grub-install` then `raiden sync efi`
 // by hand to repair). the primary member's esp is mounted at /boot/efi; the
 // others have no persistent mount point and are mounted transiently under
-// /run/raiden by `raiden sync efi`.
+// /run/raiden by `raiden sync efi`. the `exec 1>&2` keeps raiden's own output
+// (the mirror announcement it logs) clear of grub.cfg, which grub-mkconfig builds
+// from this script's stdout.
 pub const EFI_MIRROR_WRAPPER: &str =
     "#!/bin/sh\nexec 1>&2\n/usr/local/sbin/raiden sync efi --yes || true\n";
 
@@ -172,6 +174,8 @@ pub const EFI_MIRROR_HOOK_NAME: &str = "90_copy_to_efi_mirrors";
 // args; they are NOT forwarded to `raiden sync boot` (which takes no positional
 // and always mirrors the whole /boot) -- forwarding them would make clap reject
 // the call and, since this hook propagates its exit code, block kernel upgrades.
+// `exec` replaces the shell so raiden's exit code stays the hook's; raiden logs
+// the mirror step itself (primary + mirrors), so the shim stays a pure invocation.
 pub const BOOT_MIRROR_HOOK_CONTENT: &str =
     "#!/bin/sh\nexec /usr/local/sbin/raiden sync boot --yes\n";
 
@@ -188,10 +192,15 @@ pub const BOOT_MIRROR_HOOK_NAME: &str = "zzz-raiden-boot-mirror";
 // it copies the manifest to /etc/raiden inside the initrd, where Manifest::load
 // finds it with neither /boot nor the root mounted. runs in the chroot at
 // update-initramfs time, so /usr/local/sbin/raiden and /etc/raiden are the target's.
+// it does its work directly (copy_exec/cp), not via a raiden subcommand, so unlike
+// the mirror sync the announce line lives here -- after the prereqs early-exit, so
+// it logs once on the real run (not the ordering query) and is visible in the
+// update-initramfs output that otherwise says nothing about raiden being baked in.
 pub const INITRAMFS_HOOK_RAIDEN: &str = r#"#!/bin/sh
 PREREQ=""
 prereqs() { echo "$PREREQ"; }
 case $1 in prereqs) prereqs; exit 0;; esac
+echo "raiden: baking the recovery binary + manifest into the initramfs" >&2
 . /usr/share/initramfs-tools/hook-functions
 copy_exec /usr/local/sbin/raiden /sbin
 mkdir -p "${DESTDIR}/etc/raiden"
@@ -823,6 +832,24 @@ mod tests {
         assert!(
             !BOOT_MIRROR_HOOK_CONTENT.contains("$@"),
             "boot hook must not forward run-parts positional args to `raiden sync boot`"
+        );
+    }
+
+    // the recovery hook does its own work (copy_exec/cp), so its announce line lives
+    // in the script. update-initramfs invokes every hook twice -- once with a
+    // `prereqs` arg for ordering, then for real -- so the echo MUST follow the
+    // prereqs early-exit or it would also fire (and mislead) during the query pass.
+    #[test]
+    fn recovery_hook_announces_only_on_the_real_run() {
+        let exit = INITRAMFS_HOOK_RAIDEN
+            .find("prereqs) prereqs; exit 0")
+            .expect("recovery hook must early-exit on the prereqs query");
+        let echo = INITRAMFS_HOOK_RAIDEN
+            .find("echo \"raiden:")
+            .expect("recovery hook should announce itself");
+        assert!(
+            echo > exit,
+            "the announce line must follow the prereqs early-exit"
         );
     }
 }

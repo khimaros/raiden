@@ -106,11 +106,14 @@ pub fn run(
         return Ok(());
     }
 
-    // always announce the resolved source and mirrors first, before any verify or
-    // prompt, so even a verify failure (which bails without prompting) shows what
-    // we were operating on.
-    println!("source:  {src}");
-    println!("mirrors: {}", set.mirrors.join(", "));
+    // announce the operation and the resolved primary + mirrors first, before any
+    // verify or prompt, so even a verify failure (which bails without prompting)
+    // shows what we were operating on. this is the single log of the mirror step:
+    // the kernel/grub hooks are thin shims that call us with no echo of their own,
+    // so this names which device is the live primary and which are its mirrors.
+    println!("mirroring {}", set.mount);
+    println!("  primary: {src}");
+    println!("  mirrors: {}", set.mirrors.join(", "));
 
     if dry_run {
         let ofs = if set.one_file_system {

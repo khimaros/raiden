@@ -174,9 +174,11 @@ grub install, initrd (that it carries the boot/recovery binaries -- decrypt_keyc
 + keyctl, cryptsetup, and the stack's assemble/mount tools; and, when
 `install.initramfs_recovery` is on, that raiden + the manifest are baked in for
 `raiden recover`), the boot-mirror kernel
-hooks AND the esp-mirror grub.d hook (both checked for presence AND the
-executable bit, since run-parts and grub-mkconfig silently skip non-executable
-scripts), and the manifest itself. it runs every check best-effort (a dead disk
+hooks AND the esp-mirror grub.d hook (each checked for presence, the executable
+bit -- run-parts and grub-mkconfig silently skip non-executable scripts -- and
+content currency: a hook left by an older raiden whose body no longer matches the
+current version is flagged out of date, since a stale hook can break upgrades),
+and the manifest itself. it runs every check best-effort (a dead disk
 fails its own check but the rest still run), and exits non-zero if any check
 fails. `--verbose` shows full detail lines.
 
@@ -185,8 +187,10 @@ boot-mirror kernel hooks (`postinst.d`/`postrm.d`/`zzz-raiden-boot-mirror`), the
 esp-mirror grub.d hook (`90_copy_to_efi_mirrors`), and the raiden recovery hook
 (`/etc/initramfs-tools/hooks/raiden`, then rebuilds the initrd so it carries raiden
 + the manifest for `raiden recover` -- a plain rebuild cannot add them when the hook
-is absent, eg. on a legacy install) when missing or
-non-executable, re-runs `raiden sync boot`/`sync efi` to repair drifted mirrors,
+is absent, eg. on a legacy install) when missing,
+non-executable, or out of date (the re-install overwrites with the current
+content, so the same fix that adds a missing hook also refreshes a stale one left
+by an older raiden), re-runs `raiden sync boot`/`sync efi` to repair drifted mirrors,
 and re-stamps any mirror whose fs uuid diverges from the shared one so it can
 serve `/boot` or `/boot/efi` if the primary is lost. the re-stamp re-observes
 live state (it propagates the mounted source's uuid, never touches the source,
