@@ -853,3 +853,22 @@
     added an echo (to stderr, after the prereqs early-exit so it fires once on the
     real run, not the ordering query) describing the bake. guarded by a unit test
     (recovery_hook_announces_only_on_the_real_run).
+
+## configurable root volume sizing
+
+[x] expand the config with two sizing knobs. `[lvm] root_size` sizes the root
+    logical volume (vg0/root): an lvcreate percentage ("100%FREE" -- the default,
+    filling the vg; a smaller value leaves free extents for snapshots/resize) or an
+    absolute size like "100G"; --extents vs --size is chosen by whether the value
+    carries a "%". `[ext4] reserved` sets the ext4 reserved-for-root space on the
+    root fs to a small fixed size (default "512M", "0" disables) via `tune2fs -r`,
+    replacing the previous hardcoded `-m 0` (mke2fs's -m is a percentage, so it
+    cannot express an absolute reserve). reserved lives in `[ext4]` (a filesystem
+    tunable alongside `[btrfs]`/`[integrity]`), NOT `[lvm]` -- it is a fs property,
+    and "reserved for root" is the root USER, distinct from the root volume. root
+    fs only: /boot (a 512MB partition) stays at 0, and xfs/btrfs/zfs ignore it (no
+    reserved-for-root concept). shared by all three lvm stacks (md~lvm~ext4/xfs,
+    md_integrity). size parse/validate is one source of truth in config.rs
+    (parse_size_bytes/reserved_blocks/validate_root_size); validate() rejects a
+    malformed size; e2e asserts the lvcreate + tune2fs plan; unit tests cover the
+    conversions and the extents-vs-size choice.

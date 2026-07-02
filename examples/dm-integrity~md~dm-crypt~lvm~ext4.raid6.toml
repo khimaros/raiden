@@ -20,6 +20,11 @@ stack = "dm-integrity~md~dm-crypt~lvm~ext4"
 level = "6"
 metadata_level = ""
 
+[lvm]
+# size of the root logical volume: a percentage of the vg's free extents, or an
+# absolute size like "100G". the default fills the vg.
+root_size = "100%FREE"
+
 [crypt]
 # integrity is provided by dm-integrity below md, so the crypt layer is plain
 # (no aead). a plain cipher (aes-xts) is required when integrity = "none".
@@ -37,6 +42,10 @@ algorithm = "crc32c"
 
 [btrfs]
 csum = "xxhash"
+
+[ext4]
+# space ext4 reserves for the root user on the root fs (tune2fs -r); "0" disables.
+reserved = "512M"
 
 [boot]
 raid = false

@@ -59,11 +59,11 @@ impl Stack for MdLvm {
             &cfg.boot.bitmap,
             &layout.crypt_devices(),
         )];
-        s.extend(super::lvm_create_root(ROOT_MD_DEVICE));
-        s.push(match self.fs {
-            RootFs::Ext4 => super::mkfs_ext4_root(),
-            RootFs::Xfs => super::mkfs_xfs_root(),
-        });
+        s.extend(super::lvm_create_root(ROOT_MD_DEVICE, &cfg.lvm.root_size));
+        match self.fs {
+            RootFs::Ext4 => s.extend(super::mkfs_ext4_root(&cfg.ext4.reserved)),
+            RootFs::Xfs => s.push(super::mkfs_xfs_root()),
+        }
         s
     }
 

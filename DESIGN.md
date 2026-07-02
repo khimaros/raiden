@@ -109,6 +109,19 @@ so a verbatim capture would record `/mnt` and leave the booted system with no rw
 `/` entry, so `systemd-remount-fs` keeps root read-only. zfs needs no fstab root
 entry (the pool mounts it). all are uuid- or stable-path-addressed (R8).
 
+the three lvm stacks (md~lvm~ext4/xfs and dm-integrity) share `lvm_create_root`,
+which sizes `vg0/root` from `[lvm] root_size` -- an lvcreate `--extents` percentage
+(`100%FREE`, the default, filling the vg; a smaller percentage leaves headroom for
+snapshots/resize) or a `--size` absolute value (`100G`), selected by whether the
+value carries a `%`. the ext4
+stacks then apply `[ext4] reserved`, the space ext4 holds back for the root user,
+as an absolute size via `tune2fs -r` (mke2fs's `-m` is a percentage, so it cannot
+express a fixed byte reserve; the root fs is always large enough for a 4096-byte
+block, so the size converts to a block count deterministically). `reserved = "0"`
+emits no reserve step, and xfs/btrfs/zfs ignore it -- none has a reserved-for-root
+concept. the size parsing/validation lives in `config.rs` (`parse_size_bytes`,
+`reserved_blocks`, `validate_root_size`) so it is one source of truth.
+
 ## pipeline and steps
 
 a `Step` (src/step.rs) is one action: run a command, write a file, or append to

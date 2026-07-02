@@ -30,6 +30,13 @@ const BTRFS_LEVELS: &[&str] = &[
     "raid0", "raid1", "raid1c2", "raid1c3", "raid1c4", "raid5", "raid6", "raid10",
 ];
 
+// the percentage bases lvcreate accepts for --extents (a "%FREE" root_size etc.).
+const LV_PERCENT_SUFFIXES: &[&str] = &["%FREE", "%VG", "%PVS", "%ORIGIN"];
+
+// the root ext4 filesystem is always large enough that mke2fs picks a 4096-byte
+// block, so an absolute reserved size converts to a block count deterministically.
+const EXT4_BLOCK_SIZE: u64 = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
     Md,
@@ -44,9 +51,11 @@ pub struct Config {
     pub install: Install,
     pub disks: Disks,
     pub raid: Raid,
+    pub lvm: Lvm,
     pub crypt: Crypt,
     pub integrity: Integrity,
     pub btrfs: Btrfs,
+    pub ext4: Ext4,
     pub boot: Boot,
     pub benchmark: Benchmark,
 }
@@ -82,6 +91,17 @@ pub struct Raid {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct Lvm {
+    // size of the root logical volume (vg0/root), an lvcreate size expression:
+    // a percentage of the vg's free extents ("100%FREE", "50%VG") or an absolute
+    // size ("100G"). the 100%FREE default fills the vg; a smaller percentage
+    // leaves free extents for lvm snapshots and resize/fsck headroom. shared by
+    // every lvm stack.
+    pub root_size: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Crypt {
     pub cipher: String,
     pub key_size: u32,
@@ -103,6 +123,17 @@ pub struct Integrity {
 #[serde(default, deny_unknown_fields)]
 pub struct Btrfs {
     pub csum: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ext4 {
+    // blocks ext4 holds back for the root user on the root filesystem (keeps root
+    // able to log in and write when the fs is full, and limits fragmentation). an
+    // absolute size ("512M") applied via `tune2fs -r`; "0" disables. mke2fs's own
+    // default is 5% of the fs, wasteful on a large array, so raiden sets a small
+    // fixed reserve instead. applies to the root fs only, and only when it is ext4.
+    pub reserved: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -147,6 +178,22 @@ impl Default for Raid {
             stack: STACK_MD_LVM_EXT4.into(),
             level: "6".into(),
             metadata_level: String::new(),
+        }
+    }
+}
+
+impl Default for Lvm {
+    fn default() -> Self {
+        Self {
+            root_size: "100%FREE".into(),
+        }
+    }
+}
+
+impl Default for Ext4 {
+    fn default() -> Self {
+        Self {
+            reserved: "512M".into(),
         }
     }
 }
@@ -311,6 +358,18 @@ impl Config {
             );
         }
 
+        validate_root_size(&self.lvm.root_size)?;
+        // ext4.reserved: "0" or empty disables the reserve; anything else must be
+        // a parseable size. only the ext4 root stacks consult it (xfs/btrfs/zfs
+        // have no reserved-for-root concept), but validate everywhere.
+        let reserved = self.ext4.reserved.trim();
+        if !reserved.is_empty() && reserved != "0" && parse_size_bytes(reserved).is_none() {
+            bail!(
+                "ext4.reserved {:?} invalid; use a size like \"512M\", or \"0\" to disable",
+                self.ext4.reserved
+            );
+        }
+
         if self.benchmark.passes == 0 {
             bail!("benchmark.passes must be at least 1");
         }
@@ -357,6 +416,59 @@ pub fn split_disks(s: &str) -> Vec<String> {
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty())
         .collect()
+}
+
+/// parse a size like "512M", "2G", "100G" (binary units: K/M/G/T = KiB/MiB/GiB/
+/// TiB) or a bare byte count into bytes; None on a malformed value.
+pub fn parse_size_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let last = s.chars().last()?;
+    let (digits, mult) = match last.to_ascii_uppercase() {
+        'K' => (&s[..s.len() - 1], 1u64 << 10),
+        'M' => (&s[..s.len() - 1], 1u64 << 20),
+        'G' => (&s[..s.len() - 1], 1u64 << 30),
+        'T' => (&s[..s.len() - 1], 1u64 << 40),
+        _ if last.is_ascii_digit() => (s, 1),
+        _ => return None,
+    };
+    digits.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// reserved-blocks count for `tune2fs -r` on the root ext4 fs, or None when the
+/// reserve is disabled ("0" or empty). validate() rejects a malformed value, so
+/// any non-empty, non-"0" reserved parses here.
+pub fn reserved_blocks(reserved: &str) -> Option<u64> {
+    match parse_size_bytes(reserved) {
+        Some(0) | None => None,
+        Some(bytes) => Some(bytes / EXT4_BLOCK_SIZE),
+    }
+}
+
+/// validate an lvm root_size: an lvcreate percentage ("90%FREE", base 1..=100) or
+/// an absolute size ("100G").
+fn validate_root_size(s: &str) -> Result<()> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("lvm.root_size is empty; use a percentage like \"90%FREE\" or a size like \"100G\"");
+    }
+    if s.contains('%') {
+        for suf in LV_PERCENT_SUFFIXES {
+            if let Some(n) = s.strip_suffix(suf) {
+                return match n.parse::<u32>() {
+                    Ok(p) if (1..=100).contains(&p) => Ok(()),
+                    _ => bail!("lvm.root_size {s:?} percentage must be 1..=100"),
+                };
+            }
+        }
+        bail!(
+            "lvm.root_size {s:?} invalid; a percentage must end in one of {}",
+            LV_PERCENT_SUFFIXES.join(", ")
+        );
+    }
+    if parse_size_bytes(s).is_none() {
+        bail!("lvm.root_size {s:?} invalid; use \"90%FREE\" or a size like \"100G\"");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -420,5 +532,56 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(c.raid.level, "10");
+    }
+
+    #[test]
+    fn lvm_and_ext4_defaults() {
+        let c = Config::default();
+        assert_eq!(c.lvm.root_size, "100%FREE");
+        assert_eq!(c.ext4.reserved, "512M");
+    }
+
+    #[test]
+    fn parse_size_bytes_units() {
+        assert_eq!(parse_size_bytes("0"), Some(0));
+        assert_eq!(parse_size_bytes("512"), Some(512));
+        assert_eq!(parse_size_bytes("512M"), Some(512 << 20));
+        assert_eq!(parse_size_bytes("1g"), Some(1 << 30));
+        assert_eq!(parse_size_bytes("2T"), Some(2u64 << 40));
+        assert_eq!(parse_size_bytes(""), None);
+        assert_eq!(parse_size_bytes("512X"), None);
+        assert_eq!(parse_size_bytes("abc"), None);
+    }
+
+    #[test]
+    fn reserved_blocks_converts_and_disables() {
+        // 512MiB / 4096 = 131072 blocks; the default reserve.
+        assert_eq!(reserved_blocks("512M"), Some(131072));
+        assert_eq!(reserved_blocks("1G"), Some(262144));
+        // "0"/empty disable the reserve entirely.
+        assert_eq!(reserved_blocks("0"), None);
+        assert_eq!(reserved_blocks(""), None);
+    }
+
+    #[test]
+    fn root_size_validation() {
+        assert!(validate_root_size("90%FREE").is_ok());
+        assert!(validate_root_size("100%VG").is_ok());
+        assert!(validate_root_size("100G").is_ok());
+        assert!(validate_root_size("").is_err());
+        assert!(validate_root_size("150%FREE").is_err()); // over 100
+        assert!(validate_root_size("50%BOGUS").is_err()); // unknown base
+        assert!(validate_root_size("100X").is_err()); // bad unit
+    }
+
+    #[test]
+    fn reserved_size_validation() {
+        let mut c = md_config();
+        c.ext4.reserved = "512M".into();
+        assert!(c.validate().is_ok());
+        c.ext4.reserved = "0".into(); // disabled is valid
+        assert!(c.validate().is_ok());
+        c.ext4.reserved = "512X".into(); // malformed
+        assert!(c.validate().is_err());
     }
 }

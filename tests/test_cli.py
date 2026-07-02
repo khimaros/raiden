@@ -137,6 +137,53 @@ def test_install_dry_run_has_key_steps(raiden):
     assert "chroot /mnt env DEBIAN_FRONTEND=noninteractive apt-get install -y gdisk dosfstools mdadm" in out
 
 
+def test_install_lvm_root_size_and_ext4_reserve(raiden, tmp_path):
+    # the default plan sizes the root LV at 100%FREE (fills the vg) and reserves
+    # 512MiB for root on the ext4 root via tune2fs (512Mi / 4096 = 131072 blocks).
+    # root mkfs stays -m 0; the reserve is absolute.
+    out = raiden("install", "--dry-run").stdout
+    assert "lvcreate --extents=100%FREE --name=root vg0" in out
+    assert "mkfs.ext4 -m 0 /dev/vg0/root" in out
+    assert "tune2fs -r 131072 /dev/vg0/root" in out
+
+    # an absolute root_size drives lvcreate --size; a larger reserve scales the
+    # block count (1Gi / 4096 = 262144).
+    p = tmp_path / "sized.toml"
+    p.write_text(
+        '[disks]\nmembers = ["vda", "vdb", "vdc", "vdd"]\n'
+        '[raid]\nstack = "dm-crypt~md~lvm~ext4"\nlevel = "6"\n'
+        '[lvm]\nroot_size = "100G"\n'
+        '[ext4]\nreserved = "1G"\n'
+    )
+    out2 = raiden("install", "--dry-run", "--config", str(p)).stdout
+    assert "lvcreate --size=100G --name=root vg0" in out2
+    assert "tune2fs -r 262144 /dev/vg0/root" in out2
+
+    # reserved = "0" disables the reserve: mkfs runs, no tune2fs step is emitted.
+    p.write_text(
+        '[disks]\nmembers = ["vda", "vdb", "vdc", "vdd"]\n'
+        '[raid]\nstack = "dm-crypt~md~lvm~ext4"\nlevel = "6"\n'
+        '[ext4]\nreserved = "0"\n'
+    )
+    out3 = raiden("install", "--dry-run", "--config", str(p)).stdout
+    assert "mkfs.ext4 -m 0 /dev/vg0/root" in out3
+    assert "tune2fs" not in out3
+
+
+def test_config_validate_rejects_bad_root_size(raiden, tmp_path):
+    # a percentage over 100 (or an otherwise malformed size) is caught by validate,
+    # before any disk is touched.
+    p = tmp_path / "bad.toml"
+    p.write_text(
+        '[disks]\nmembers = ["vda", "vdb"]\n'
+        '[raid]\nstack = "dm-crypt~md~lvm~ext4"\nlevel = "1"\n'
+        '[lvm]\nroot_size = "150%FREE"\n'
+    )
+    r = raiden("config", "validate", "--config", str(p), expect_ok=False)
+    assert r.returncode != 0
+    assert "root_size" in r.stderr
+
+
 def test_install_bakes_raiden_into_the_initrd_for_recovery(raiden):
     # initramfs_recovery (default on): after the binary + manifest are staged, the
     # finish phase installs the raiden initramfs hook and rebuilds the initrd so it

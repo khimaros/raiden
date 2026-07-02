@@ -611,8 +611,20 @@ pub fn md_stop_holders(devices: &[String]) -> Step {
     .best_effort()
 }
 
-/// create the vg0/root logical volume on the given physical volume.
-pub fn lvm_create_root(pv: &str) -> Vec<Step> {
+/// the lvcreate sizing flag for a configured root_size: `--extents` for a
+/// percentage expression ("90%FREE"), `--size` for an absolute size ("100G").
+fn lvcreate_size_arg(root_size: &str) -> String {
+    let s = root_size.trim();
+    if s.contains('%') {
+        format!("--extents={s}")
+    } else {
+        format!("--size={s}")
+    }
+}
+
+/// create the vg0/root logical volume on the given physical volume, sized per the
+/// configured root_size (the rest of the vg is left free for snapshots/headroom).
+pub fn lvm_create_root(pv: &str, root_size: &str) -> Vec<Step> {
     vec![
         Step::run_owned(
             format!("create physical volume on {pv}"),
@@ -622,9 +634,14 @@ pub fn lvm_create_root(pv: &str) -> Vec<Step> {
             "create volume group vg0",
             vec!["vgcreate".to_string(), "vg0".to_string(), pv.to_string()],
         ),
-        Step::run(
-            "create logical volume vg0/root",
-            &["lvcreate", "--extents=90%FREE", "--name=root", "vg0"],
+        Step::run_owned(
+            format!("create logical volume vg0/root ({root_size})"),
+            vec![
+                "lvcreate".to_string(),
+                lvcreate_size_arg(root_size),
+                "--name=root".to_string(),
+                "vg0".to_string(),
+            ],
         ),
     ]
 }
@@ -637,13 +654,28 @@ pub fn lvm_deactivate() -> Step {
     Step::run("deactivate vg0", &["vgchange", "-a", "n", "vg0"]).best_effort()
 }
 
-/// format vg0/root as ext4. stride/stripe-width are aligned to the real md
-/// geometry at run time, which is why no -E options appear here.
-pub fn mkfs_ext4_root() -> Step {
-    Step::run(
+/// format vg0/root as ext4 and set the configured reserved-for-root blocks.
+/// stride/stripe-width are aligned to the real md geometry at run time, which is
+/// why no -E options appear here. mkfs uses -m 0 (mke2fs's reserved percentage
+/// cannot express an absolute size); the reserve is then applied as an absolute
+/// block count with `tune2fs -r`, skipped when reserved is "0".
+pub fn mkfs_ext4_root(reserved: &str) -> Vec<Step> {
+    let mut s = vec![Step::run(
         "format vg0/root as ext4 (aligned to md geometry at run time)",
         &["mkfs.ext4", "-m", "0", "/dev/vg0/root"],
-    )
+    )];
+    if let Some(blocks) = crate::config::reserved_blocks(reserved) {
+        s.push(Step::run_owned(
+            format!("reserve {reserved} for root on vg0/root"),
+            vec![
+                "tune2fs".to_string(),
+                "-r".to_string(),
+                blocks.to_string(),
+                "/dev/vg0/root".to_string(),
+            ],
+        ));
+    }
+    s
 }
 
 /// append the ext4 root line to the target fstab.
@@ -851,5 +883,22 @@ mod tests {
             echo > exit,
             "the announce line must follow the prereqs early-exit"
         );
+    }
+
+    // a percentage root_size drives lvcreate --extents; an absolute size --size.
+    #[test]
+    fn lvcreate_size_arg_picks_extents_or_size() {
+        assert_eq!(lvcreate_size_arg("90%FREE"), "--extents=90%FREE");
+        assert_eq!(lvcreate_size_arg("50%VG"), "--extents=50%VG");
+        assert_eq!(lvcreate_size_arg("100G"), "--size=100G");
+    }
+
+    // the ext4 root reserve is applied with tune2fs -r after mkfs, and skipped
+    // entirely when disabled ("0") so no reserve step is emitted.
+    #[test]
+    fn mkfs_ext4_root_reserve_is_optional() {
+        let with = mkfs_ext4_root("512M");
+        assert_eq!(with.len(), 2);
+        assert_eq!(mkfs_ext4_root("0").len(), 1);
     }
 }

@@ -249,6 +249,17 @@ format, at the cost of leaving tags uninitialized (reads of unwritten sectors fa
 until written, and it conflicts with the md array's initial resync) -- see the
 caveat in [raiden.toml](raiden.toml).
 
+on the lvm stacks (md~lvm~ext4/xfs and the dm-integrity stack), `[lvm] root_size`
+sizes the root logical volume (`vg0/root`): a percentage of the vg's free extents
+(`"100%FREE"`, the default, filling the vg) or an absolute size (`"100G"`). use a
+smaller percentage (eg. `"90%FREE"`) to leave free extents for lvm snapshots and
+resize headroom. for the ext4 root,
+`[ext4] reserved` sets the space ext4 holds back for the root user (so root can
+still log in and write when the fs fills) to a small fixed size (`"512M"` by
+default, `"0"` to disable) via `tune2fs -r`, instead of mke2fs's default 5% which
+is wasteful on a large array. it applies to the root filesystem only; xfs, btrfs,
+and zfs have no equivalent reserved-for-root setting.
+
 by default `/boot` is not a raid array: each disk carries its own ext4 `/boot`
 (all sharing one fs uuid), so every disk's grub boots from its local copy and the
 system survives losing any disk -- including the first -- with no array to

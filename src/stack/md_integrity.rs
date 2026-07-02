@@ -45,8 +45,11 @@ impl Stack for MdIntegrity {
             ROOT_CRYPT_NAME,
             format!("unlock {ROOT_MD_DEVICE} as {ROOT_CRYPT_NAME}"),
         ));
-        s.extend(super::lvm_create_root(ROOT_CRYPT_DEVICE));
-        s.push(super::mkfs_ext4_root());
+        s.extend(super::lvm_create_root(
+            ROOT_CRYPT_DEVICE,
+            &cfg.lvm.root_size,
+        ));
+        s.extend(super::mkfs_ext4_root(&cfg.ext4.reserved));
         s
     }
 

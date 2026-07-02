@@ -56,7 +56,8 @@ it is never okay to regress on a "must not regress" requirement in a release.
 - R11. tunable layer options: dm-crypt cipher, key size, sector size, aead
   integrity (and optionally skipping its full-device wipe); dm-integrity
   algorithm; btrfs checksum algorithm; ext4 stride/stripe-width aligned to the
-  real md geometry.
+  real md geometry; lvm root logical volume size (a percentage of the vg or an
+  absolute size); and the ext4 reserved-for-root space on the root filesystem.
 - R12. post-install operations:
   - `status`: array health, plus mapping md read errors back to affected file
     paths (md stacks) via raid-stripe geometry, dmsetup offsets, and debugfs.

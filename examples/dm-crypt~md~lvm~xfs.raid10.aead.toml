@@ -20,6 +20,11 @@ stack = "dm-crypt~md~lvm~xfs"
 level = "10"
 metadata_level = ""
 
+[lvm]
+# size of the root logical volume: a percentage of the vg's free extents, or an
+# absolute size like "100G". the default fills the vg.
+root_size = "100%FREE"
+
 [crypt]
 # aegis128 is an aead cipher, so it requires crypt integrity = "aead".
 cipher = "aegis128-plain64"

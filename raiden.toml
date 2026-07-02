@@ -24,7 +24,6 @@ initramfs_recovery = true
 [disks]
 # explicit list of member disks (no glob/eval). a stable id under /dev is fine.
 members = ["vda", "vdb", "vdc", "vdd"]
-# partition name prefix; usually "p" for nvme, empty otherwise
 
 [raid]
 # stack identifier, one of:
@@ -40,6 +39,13 @@ stack = "dm-crypt~md~lvm~ext4"
 level = "6"
 # metadata level (btrfs only); empty defaults to level
 metadata_level = ""
+
+[lvm]
+# size of the root logical volume (vg0/root) on the lvm stacks. a percentage of
+# the vg's free extents ("100%FREE", "50%VG") or an absolute size ("100G"). the
+# default fills the vg; use a smaller percentage (eg. "90%FREE") to leave free
+# extents for lvm snapshots and resize/fsck headroom.
+root_size = "100%FREE"
 
 [crypt]
 cipher = "aegis128-plain64"
@@ -66,6 +72,15 @@ algorithm = "xxhash64"
 #   crc32c (default), xxhash, sha256, blake2
 [btrfs]
 csum = "xxhash"
+
+# ext4 root stacks only (ignored by xfs/btrfs/zfs, which have no equivalent).
+[ext4]
+# space ext4 holds back for the root user on the root filesystem, so root can
+# still log in and write when the fs fills, and to limit fragmentation. an
+# absolute size applied via `tune2fs -r`; "0" disables it. mke2fs's own default
+# is 5% of the fs (wasteful on a large array), so raiden sets a small fixed
+# reserve instead. /boot keeps no reserve (it is a small dedicated partition).
+reserved = "512M"
 
 [boot]
 # put /boot on an md raid1 array across all disks (raid = true), or give each
