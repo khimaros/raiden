@@ -113,6 +113,7 @@ raiden status                   # array health + read-errors mapped to files
 raiden status --bad-files       # only the files hit by unrecoverable read errors
 raiden scrub --wait
 raiden rescue                   # assemble + unlock + mount (livecd -> chroot)
+raiden open                     # unlock + assemble, no mount (rescue without the mount)
 raiden recover                  # bring a degraded root online from the initramfs
 raiden mount                    # ensure the stack is open + mounted (idempotent)
 raiden mount --boot --at /      # just (re)mount /boot + /boot/efi on a live system
@@ -135,7 +136,10 @@ regenerated for the new crypt names. `--with` is optional -- without it, replace
 is the in-place rebuild. `raiden mount` brings
 the stack up from the first available member (the primary ESP mounts at `/boot/efi`;
 mirrors are synced transiently), so a lost-primary system stays serviceable until a
-`replace`.
+`replace`. `raiden open` is `rescue` without the mount: it unlocks the crypt,
+assembles the array, and activates the volume group but mounts nothing, leaving
+`/dev/vg0/root` (or the crypt/array devices) available for offline work like `fsck`,
+`resize2fs`, or `dd`. it is the inverse of `close`.
 
 `raiden recover` brings a degraded root online from the initramfs rescue shell so
 the boot can continue, generalizing the per-stack manual `mount -o degraded`

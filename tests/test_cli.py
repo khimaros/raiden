@@ -341,6 +341,19 @@ def test_rescue_activates_lvm_before_mount(raiden):
     assert out.index("vgchange -a y vg0") < out.index("mount /dev/vg0/root /mnt")
 
 
+def test_open_unlocks_and_assembles_without_mounting(raiden):
+    # open is rescue without the mount: it installs tools, tears down partial
+    # state, unlocks crypt, assembles the array, and activates the vg -- but
+    # mounts nothing (no root, no /boot, no chroot bind), leaving the devices
+    # available for offline work.
+    out = raiden("open", "--dry-run").stdout
+    assert "cryptsetup luksOpen" in out
+    assert "vgchange -a y vg0" in out
+    assert "mount /dev/vg0/root" not in out
+    assert "=== phase: mount ===" not in out
+    assert "=== phase: bind ===" not in out
+
+
 def test_mount_full_opens_and_mounts_the_stack(raiden):
     # the full mount opens crypt, assembles, activates, and mounts root + boot/efi.
     out = raiden("mount", "--dry-run").stdout

@@ -88,6 +88,9 @@ pub enum Command {
     },
     /// assemble, unlock, and mount from a livecd
     Rescue,
+    /// unlock crypt and assemble the array from a livecd, without mounting
+    /// (rescue without the mount); the inverse of close
+    Open,
     /// bring a degraded root online from the initramfs so the boot can continue
     Recover(RecoverArgs),
     /// ensure the stack is open and mounted (or just /boot + /boot/efi with --boot)

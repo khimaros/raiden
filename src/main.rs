@@ -63,6 +63,12 @@ fn main() -> Result<()> {
                 Ok(ops::rescue(c, l, s))
             })
         }
+        Command::Open => {
+            let (cfg, stack) = resolve_op(g, &overrides)?;
+            run_op(g, &cfg, stack.as_ref(), "open", false, "", |c, l, s| {
+                Ok(ops::open(c, l, s))
+            })
+        }
         Command::Recover(args) => cmd_recover(g, &overrides, args),
         Command::Mount(args) => {
             // full mount lands at /mnt (mount_root is /mnt-relative); --boot honors

@@ -133,9 +133,12 @@ native write steps.
 
 the install pipeline (src/pipeline.rs) assembles phases as reusable builders --
 apt, prepare, reset, partition, format, mount, strap, install, bootloader,
-finish, close -- so operations (src/ops.rs: rescue, mount, replace, remove, close,
-scrub, status) compose the subset they need. `--from`/`--only` restrict the
-install to a phase; `--list-phases` prints them.
+finish, close -- so operations (src/ops.rs: rescue, open, mount, replace, remove,
+close, scrub, status) compose the subset they need. `rescue` is `open` plus the
+mount + bind phases, so the two stay in lockstep -- `open` (apt, prepare, close,
+map) unlocks and assembles without mounting, and `rescue` adds the root mount and
+the chroot binds on top. `--from`/`--only` restrict the install to a phase;
+`--list-phases` prints them.
 
 the `reset` phase makes install re-runnable: before partitioning it tears down
 any prior stack on the members (the same best-effort `teardown_steps` that

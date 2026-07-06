@@ -424,6 +424,14 @@
     terminal control sequences before returning, which also de-junks the graded
     report details. regression-tested in test_log.py.
 
+[x] `raiden open`: rescue without the mount. brings the stack up from a livecd
+    (install tools, tear down partial state, then unlock crypt + assemble the
+    array + activate lvm) but stops before mounting root and binding the chroot
+    -- so /dev/vg0/root (or the crypt/array devices) are available for offline
+    work (fsck, resize, dd, blkid) without a mount. the exact inverse of `close`.
+    rescue is now defined as `open` + the mount + bind phases, so the two stay in
+    lockstep. livecd-capable like rescue/mount (no manifest required).
+
 [ ] run the vm harness against all four stacks on a kvm host and commit
     a result-YYYY-MM.md per stack (needs a libvirt host)
 [ ] rescue boot: instrument the efi boot manager via send-key to select the
