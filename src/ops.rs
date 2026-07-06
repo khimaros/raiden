@@ -14,25 +14,21 @@ use crate::step::{Phase, Step};
 // (efi::SHIM_FILE) and the efibootmgr/shim paths live in crate::efi.
 const GRUB_CFG_FILE: &str = "grub/grub.cfg";
 
-/// unlock + assemble the array from a livecd, after first installing tools and
-/// tearing down any partial state -- but without mounting root or binding the
-/// chroot. leaves the crypt/array/lvm devices open (eg. /dev/vg0/root) for
-/// offline work (fsck, resize, dd, blkid). the inverse of `close`.
-pub fn open(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Vec<Phase> {
-    vec![
+/// assemble + unlock + mount from a livecd, after first installing tools and
+/// tearing down any partial state. `no_mount` stops after the array is open
+/// (apt, prepare, close, map), leaving root unmounted and the chroot unbound for
+/// offline work (fsck, resize, dd) on the open crypt/array/lvm devices.
+pub fn rescue(cfg: &Config, layout: &Layout, stack: &dyn Stack, no_mount: bool) -> Vec<Phase> {
+    let mut phases = vec![
         pipeline::apt_phase(cfg, stack),
         pipeline::prepare_phase(),
         pipeline::close_phase(cfg, layout, stack),
-        Phase::new("map", stack.map(cfg, layout)),
-    ]
-}
-
-/// assemble + unlock + mount from a livecd: `open`, then mount root and bind the
-/// chroot, so the target is ready to chroot into.
-pub fn rescue(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Vec<Phase> {
-    let mut phases = open(cfg, layout, stack);
-    phases.push(Phase::new("mount", stack.mount_root(cfg, layout)));
-    phases.push(pipeline::bind_phase(cfg, layout));
+        Phase::new(pipeline::MAP, stack.map(cfg, layout)),
+    ];
+    if !no_mount {
+        phases.push(Phase::new(pipeline::MOUNT, stack.mount_root(cfg, layout)));
+        phases.push(pipeline::bind_phase(cfg, layout));
+    }
     phases
 }
 

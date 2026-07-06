@@ -424,13 +424,31 @@
     terminal control sequences before returning, which also de-junks the graded
     report details. regression-tested in test_log.py.
 
-[x] `raiden open`: rescue without the mount. brings the stack up from a livecd
-    (install tools, tear down partial state, then unlock crypt + assemble the
-    array + activate lvm) but stops before mounting root and binding the chroot
-    -- so /dev/vg0/root (or the crypt/array devices) are available for offline
-    work (fsck, resize, dd, blkid) without a mount. the exact inverse of `close`.
-    rescue is now defined as `open` + the mount + bind phases, so the two stay in
-    lockstep. livecd-capable like rescue/mount (no manifest required).
+[x] `raiden run <phase>...`: a generic phase runner instead of a bespoke command
+    per phase-subset. pipeline::build_phase is a name->builder registry (the install
+    pipeline plus the `map` operation phase), RUNNABLE_PHASES lists them, and
+    --list-phases prints them. runs the named phases in the given order (no
+    reordering); phase_is_destructive (reset/partition/format) drives the same
+    confirm guard install uses; resolves config from the manifest or a config file
+    like install/rescue (livecd-capable). eg. `run apt prepare close map` unlocks +
+    assembles without mounting -- what a dedicated `open` command would have done, so
+    that command was dropped in favour of this. parameterized ops (mount/replace/
+    remove) stay typed commands (args + guards + resume scope a registry can't hold).
+
+[x] rescue --no-mount: unlock + assemble without mounting. omits the trailing mount +
+    bind phases (leaving apt, prepare, close, map), so root stays unmounted and the
+    crypt/array/lvm devices are open for offline work (fsck, resize, dd). the named,
+    discoverable form of `run apt prepare close map`; --no-mount is folded into the
+    resume scope so it cannot cross the two plan shapes.
+
+[x] close: drop the install-manifest requirement. close is the livecd teardown pair
+    for rescue/mount (unmount, stop arrays, lock crypt) and, like them, resolves from
+    a config file when there is no manifest -- so it works from a livecd after a
+    rescue/mount attempt. it is also near-useless on a booted system (the running
+    root's vg cannot be deactivated), so requiring the manifest matched neither its
+    main use nor its siblings. non-destructive teardown, so the stray-raiden.toml
+    concern that gates doctor/replace/remove is minor here. no vm coverage exercised
+    the standalone command either way.
 
 [ ] run the vm harness against all four stacks on a kvm host and commit
     a result-YYYY-MM.md per stack (needs a libvirt host)

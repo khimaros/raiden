@@ -113,11 +113,13 @@ raiden status                   # array health + read-errors mapped to files
 raiden status --bad-files       # only the files hit by unrecoverable read errors
 raiden scrub --wait
 raiden rescue                   # assemble + unlock + mount (livecd -> chroot)
-raiden open                     # unlock + assemble, no mount (rescue without the mount)
+raiden rescue --no-mount        # unlock + assemble only, leave root unmounted
 raiden recover                  # bring a degraded root online from the initramfs
 raiden mount                    # ensure the stack is open + mounted (idempotent)
 raiden mount --boot --at /      # just (re)mount /boot + /boot/efi on a live system
 raiden close                    # unmount, stop arrays, lock crypt
+raiden run apt prepare close map  # run specific phases (here: unlock + assemble, no mount)
+raiden run --list-phases        # list the runnable phase names
 raiden remove --disks vdb
 raiden sync boot                # resync the independent /boot mirrors from the live primary
 raiden sync efi                 # resync the esp mirrors from the live /boot/efi (efi mode)
@@ -136,10 +138,18 @@ regenerated for the new crypt names. `--with` is optional -- without it, replace
 is the in-place rebuild. `raiden mount` brings
 the stack up from the first available member (the primary ESP mounts at `/boot/efi`;
 mirrors are synced transiently), so a lost-primary system stays serviceable until a
-`replace`. `raiden open` is `rescue` without the mount: it unlocks the crypt,
-assembles the array, and activates the volume group but mounts nothing, leaving
-`/dev/vg0/root` (or the crypt/array devices) available for offline work like `fsck`,
-`resize2fs`, or `dd`. it is the inverse of `close`.
+`replace`. `rescue`, `mount`, and `close` are the livecd flow -- they resolve from a
+config file (`--config`) when there is no install manifest yet. `rescue --no-mount`
+unlocks the crypt and assembles the array but leaves root unmounted, so
+`/dev/vg0/root` (or the crypt/array devices) is available for offline work like
+`fsck`, `resize2fs`, or `dd` before you `close`.
+
+`raiden run` is the general form: it builds an arbitrary, ordered set of pipeline
+phases by name (see `--list-phases`), so a one-off subset needs no dedicated command
+(`rescue --no-mount` is the same as `raiden run apt prepare close map`). the wipe
+phases (`reset`, `partition`, `format`) confirm before running unless `--yes`. it
+runs the phases in the order given, so it trades the typed commands' ordering
+guarantees for flexibility -- name them in a sensible order.
 
 `raiden recover` brings a degraded root online from the initramfs rescue shell so
 the boot can continue, generalizing the per-stack manual `mount -o degraded`

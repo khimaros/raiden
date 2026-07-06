@@ -21,10 +21,56 @@ pub const INSTALL: &str = "install";
 pub const BOOTLOADER: &str = "bootloader";
 pub const FINISH: &str = "finish";
 pub const CLOSE: &str = "close";
+// the operation phase (unlock crypt + assemble the array + activate lvm). not
+// part of the install pipeline, but composable by `raiden run` and used by rescue.
+pub const MAP: &str = "map";
 
 pub const PHASES: &[&str] = &[
     APT, PREPARE, RESET, PARTITION, FORMAT, MOUNT, STRAP, BIND, INSTALL, BOOTLOADER, FINISH, CLOSE,
 ];
+
+/// every phase `raiden run` can build by name: the install pipeline plus `map`.
+/// parameterized ops (mount --at, replace, remove) stay their own commands.
+pub const RUNNABLE_PHASES: &[&str] = &[
+    APT, PREPARE, RESET, PARTITION, FORMAT, MOUNT, STRAP, BIND, INSTALL, BOOTLOADER, FINISH, CLOSE,
+    MAP,
+];
+
+/// phases that erase or reformat the member disks, so `raiden run` confirms before
+/// running them (unless --yes), matching install's destructive guard.
+pub fn phase_is_destructive(name: &str) -> bool {
+    matches!(name, RESET | PARTITION | FORMAT)
+}
+
+/// build one phase by name for `raiden run`. the single registry mapping a phase
+/// name to its builder, so the composable ops need no per-op command. `install`
+/// and `finish` take the same parameters install resolves (root-password mode,
+/// the staged binary path).
+pub fn build_phase(
+    name: &str,
+    cfg: &Config,
+    layout: &Layout,
+    stack: &dyn Stack,
+    auto_root_password: bool,
+    raiden_bin: Option<&str>,
+) -> anyhow::Result<Phase> {
+    Ok(match name {
+        APT => apt_phase(cfg, stack),
+        PREPARE => prepare_phase(),
+        RESET => reset_phase(cfg, layout, stack),
+        PARTITION => partition_phase(cfg, layout, stack),
+        FORMAT => format_phase(cfg, layout, stack),
+        MOUNT => Phase::new(MOUNT, stack.mount_root(cfg, layout)),
+        STRAP => strap_phase(cfg),
+        BIND => bind_phase(cfg, layout),
+        INSTALL => install_base_phase(cfg, stack, auto_root_password),
+        BOOTLOADER => bootloader_phase(cfg, layout),
+        FINISH => finish_phase(cfg, layout, stack, raiden_bin),
+        CLOSE => close_phase(cfg, layout, stack),
+        MAP => Phase::new(MAP, stack.map(cfg, layout)),
+        _ => anyhow::bail!("unknown phase {name:?}; see `raiden run --list-phases`"),
+    })
+}
 
 // vfat mount options for every esp, matching what grub-install would write.
 pub const EFI_OPTS: &str =

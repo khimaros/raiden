@@ -87,10 +87,10 @@ pub enum Command {
         wait: bool,
     },
     /// assemble, unlock, and mount from a livecd
-    Rescue,
-    /// unlock crypt and assemble the array from a livecd, without mounting
-    /// (rescue without the mount); the inverse of close
-    Open,
+    Rescue(RescueArgs),
+    /// run specific pipeline phases by name (see --list-phases), eg.
+    /// `raiden run apt prepare close map` to unlock + assemble without mounting
+    Run(RunArgs),
     /// bring a degraded root online from the initramfs so the boot can continue
     Recover(RecoverArgs),
     /// ensure the stack is open and mounted (or just /boot + /boot/efi with --boot)
@@ -122,6 +122,25 @@ pub struct RecoverArgs {
     /// initramfs convention (init expects $rootmnt there); use /mnt from a livecd
     #[arg(long, default_value = "/root")]
     pub at: String,
+}
+
+#[derive(Args)]
+pub struct RescueArgs {
+    /// unlock and assemble but do not mount root or bind the chroot, leaving the
+    /// crypt/array/lvm devices open for offline work (fsck, resize, dd)
+    #[arg(long)]
+    pub no_mount: bool,
+}
+
+#[derive(Args)]
+pub struct RunArgs {
+    /// phases to run, in the given order (eg. `apt prepare close map`);
+    /// see --list-phases for the names
+    #[arg(value_name = "PHASE")]
+    pub phases: Vec<String>,
+    /// list the runnable phase names and exit
+    #[arg(long)]
+    pub list_phases: bool,
 }
 
 #[derive(Args)]

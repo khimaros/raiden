@@ -24,7 +24,7 @@ use clap::Parser;
 
 use checkpoint::Checkpoint;
 use cli::{
-    BenchmarkArgs, Cli, Command, ConfigCmd, DoctorArgs, Global, InstallArgs, RecoverArgs,
+    BenchmarkArgs, Cli, Command, ConfigCmd, DoctorArgs, Global, InstallArgs, RecoverArgs, RunArgs,
     StatusArgs, SyncArgs, SyncTarget,
 };
 use config::{Config, Family, Overrides};
@@ -57,18 +57,23 @@ fn main() -> Result<()> {
                 Ok(ops::scrub(c, l, s))
             })
         }
-        Command::Rescue => {
+        Command::Rescue(args) => {
+            let no_mount = args.no_mount;
+            // --no-mount omits the trailing mount + bind phases; capture it in the
+            // scope so a resume cannot cross the two plan shapes.
+            let scope = if no_mount { "no-mount" } else { "" };
             let (cfg, stack) = resolve_op(g, &overrides)?;
-            run_op(g, &cfg, stack.as_ref(), "rescue", false, "", |c, l, s| {
-                Ok(ops::rescue(c, l, s))
-            })
+            run_op(
+                g,
+                &cfg,
+                stack.as_ref(),
+                "rescue",
+                false,
+                scope,
+                move |c, l, s| Ok(ops::rescue(c, l, s, no_mount)),
+            )
         }
-        Command::Open => {
-            let (cfg, stack) = resolve_op(g, &overrides)?;
-            run_op(g, &cfg, stack.as_ref(), "open", false, "", |c, l, s| {
-                Ok(ops::open(c, l, s))
-            })
-        }
+        Command::Run(args) => cmd_run(g, &overrides, args),
         Command::Recover(args) => cmd_recover(g, &overrides, args),
         Command::Mount(args) => {
             // full mount lands at /mnt (mount_root is /mnt-relative); --boot honors
@@ -91,7 +96,9 @@ fn main() -> Result<()> {
             )
         }
         Command::Close => {
-            require_installed(g)?;
+            // close is the livecd teardown pair for rescue/mount (unmount, stop
+            // arrays, lock crypt); like them it resolves from a config file when
+            // there is no manifest, so it does not require an installed system.
             let (cfg, stack) = resolve_op(g, &overrides)?;
             run_op(g, &cfg, stack.as_ref(), "close", false, "", |c, l, s| {
                 Ok(ops::close(c, l, s))
@@ -184,12 +191,7 @@ fn cmd_install(g: &Global, overrides: &Overrides, args: &InstallArgs) -> Result<
     cfg.validate()?;
     let layout = Layout::derive(&cfg);
     let stack = stack::select(&cfg.raid.stack)?;
-    // an unattended run (password provided non-interactively) also sets the root
-    // password non-interactively, to the disk password.
-    let auto_root = g.password_file.is_some()
-        || std::env::var("RAIDEN_PASSWORD")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+    let auto_root = auto_root_password(g);
     // the running binary is copied into the target so post-install ops work after
     // reboot; if its path cannot be resolved, the copy step is simply omitted.
     let exe = std::env::current_exe().ok();
@@ -618,6 +620,60 @@ fn cmd_devices(g: &Global, overrides: &Overrides) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `raiden run`: build and run an arbitrary, ordered set of pipeline phases by
+/// name (the generic phase runner, so composable ops need no bespoke command).
+/// resolves config from the manifest or a config file like install/rescue, so it
+/// works from a livecd; the wipe phases (reset/partition/format) confirm first.
+fn cmd_run(g: &Global, overrides: &Overrides, args: &RunArgs) -> Result<()> {
+    if args.list_phases {
+        for p in pipeline::RUNNABLE_PHASES {
+            println!("{p}");
+        }
+        return Ok(());
+    }
+    if args.phases.is_empty() {
+        bail!("no phases given; name one or more (see `raiden run --list-phases`)");
+    }
+    for name in &args.phases {
+        if !pipeline::RUNNABLE_PHASES.contains(&name.as_str()) {
+            bail!("unknown phase {name:?}; see `raiden run --list-phases`");
+        }
+    }
+    let (cfg, stack) = resolve_op(g, overrides)?;
+    let auto_root = auto_root_password(g);
+    // finish copies the running binary into the target; resolve its path once.
+    let exe = std::env::current_exe().ok();
+    let raiden_bin = exe.as_deref().and_then(Path::to_str);
+    let phases = args.phases.clone();
+    let destructive = phases.iter().any(|p| pipeline::phase_is_destructive(p));
+    // the exact phase list is the resume scope, so a changed set refuses a stale
+    // checkpoint (as replace's --disks/--parts scope does).
+    let scope = phases.join(",");
+    run_op(
+        g,
+        &cfg,
+        stack.as_ref(),
+        "run",
+        destructive,
+        &scope,
+        move |c, l, s| {
+            phases
+                .iter()
+                .map(|n| pipeline::build_phase(n, c, l, s, auto_root, raiden_bin))
+                .collect::<Result<Vec<_>>>()
+        },
+    )
+}
+
+/// an unattended run (password provided via file or env) also sets the root
+/// password non-interactively, to the disk password.
+fn auto_root_password(g: &Global) -> bool {
+    g.password_file.is_some()
+        || std::env::var("RAIDEN_PASSWORD")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
 }
 
 /// restrict the install pipeline to a single phase (--only) or a suffix (--from).

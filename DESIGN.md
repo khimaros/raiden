@@ -133,12 +133,20 @@ native write steps.
 
 the install pipeline (src/pipeline.rs) assembles phases as reusable builders --
 apt, prepare, reset, partition, format, mount, strap, install, bootloader,
-finish, close -- so operations (src/ops.rs: rescue, open, mount, replace, remove,
-close, scrub, status) compose the subset they need. `rescue` is `open` plus the
-mount + bind phases, so the two stay in lockstep -- `open` (apt, prepare, close,
-map) unlocks and assembles without mounting, and `rescue` adds the root mount and
-the chroot binds on top. `--from`/`--only` restrict the install to a phase;
-`--list-phases` prints them.
+finish, close -- so operations (src/ops.rs: rescue, mount, replace, remove, close,
+scrub, status) compose the subset they need. `rescue --no-mount` drops the trailing
+mount + bind phases (it is `apt, prepare, close, map`), leaving root unmounted for
+offline work. `--from`/`--only` restrict the install to a phase; `--list-phases`
+prints them.
+
+`raiden run <phase>...` is the generic form: `pipeline::build_phase` is a registry
+mapping each phase name (the install pipeline plus the `map` operation phase that
+unlocks + assembles) to its builder, so an arbitrary ordered subset runs without a
+bespoke command -- `run apt prepare close map` unlocks and assembles without
+mounting. it runs the phases in the given order (no reordering), and
+`phase_is_destructive` (reset/partition/format) drives the same confirmation guard
+install uses. the parameterized ops (mount --at, replace, remove) carry args, guards,
+and resume scope a name-only registry cannot express, so they stay typed commands.
 
 the `reset` phase makes install re-runnable: before partitioning it tears down
 any prior stack on the members (the same best-effort `teardown_steps` that

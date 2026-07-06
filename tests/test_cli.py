@@ -341,17 +341,44 @@ def test_rescue_activates_lvm_before_mount(raiden):
     assert out.index("vgchange -a y vg0") < out.index("mount /dev/vg0/root /mnt")
 
 
-def test_open_unlocks_and_assembles_without_mounting(raiden):
-    # open is rescue without the mount: it installs tools, tears down partial
-    # state, unlocks crypt, assembles the array, and activates the vg -- but
-    # mounts nothing (no root, no /boot, no chroot bind), leaving the devices
-    # available for offline work.
-    out = raiden("open", "--dry-run").stdout
+def test_run_composes_arbitrary_phases_in_order(raiden):
+    # `run` builds any named phases in the given order, so a subset op needs no
+    # bespoke command: `run apt prepare close map` unlocks + assembles without
+    # mounting (what an `open` command would do), and mounts nothing unasked.
+    out = raiden("run", "apt", "prepare", "close", "map", "--dry-run").stdout
+    order = [out.index(f"=== phase: {p} ===") for p in ("apt", "prepare", "close", "map")]
+    assert order == sorted(order)
     assert "cryptsetup luksOpen" in out
     assert "vgchange -a y vg0" in out
     assert "mount /dev/vg0/root" not in out
-    assert "=== phase: mount ===" not in out
     assert "=== phase: bind ===" not in out
+
+
+def test_run_lists_runnable_phases(raiden):
+    # --list-phases enumerates the install pipeline plus the `map` operation phase.
+    phases = raiden("run", "--list-phases").stdout.split()
+    assert "map" in phases
+    assert {"partition", "format", "close"} <= set(phases)
+
+
+def test_run_rejects_an_unknown_phase(raiden):
+    r = raiden("run", "frobnicate", "--dry-run", expect_ok=False)
+    assert r.returncode != 0
+    assert "unknown phase" in r.stderr
+
+
+def test_rescue_no_mount_stops_after_the_array_is_open(raiden):
+    # --no-mount runs apt/prepare/close/map (unlock + assemble) but omits the
+    # trailing mount + bind, leaving root unmounted for offline work.
+    out = raiden("rescue", "--no-mount", "--dry-run").stdout
+    assert "cryptsetup luksOpen" in out
+    assert "vgchange -a y vg0" in out
+    assert "mount /dev/vg0/root" not in out
+    assert "=== phase: bind ===" not in out
+    # plain rescue still mounts and binds.
+    full = raiden("rescue", "--dry-run").stdout
+    assert "mount /dev/vg0/root /mnt" in full
+    assert "=== phase: bind ===" in full
 
 
 def test_mount_full_opens_and_mounts_the_stack(raiden):
@@ -716,10 +743,12 @@ def test_resume_rejects_a_different_operation(raiden, tmp_path):
 
 
 def test_post_install_ops_require_an_install_manifest(raiden):
-    # doctor/sync/status/scrub/replace/remove/close only run on an installed raiden
+    # doctor/sync/status/scrub/replace/remove only run on an installed raiden
     # system: with no manifest (and not --dry-run) they refuse up front, before
     # inspecting or touching anything -- so a stray raiden.toml in cwd can't make
     # `doctor --fix` mutate a non-install host. (bails at the guard, so host-safe.)
+    # rescue/mount/close/run are exempt: they are the livecd flow, run from a
+    # config file when no manifest exists yet.
     r = raiden("doctor", expect_ok=False)
     assert r.returncode != 0
     assert "only runs on an installed raiden system" in r.stderr
