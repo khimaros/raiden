@@ -22,8 +22,13 @@ serial_console = false
 initramfs_recovery = true
 
 [disks]
-# explicit list of member disks (no glob/eval). a stable id under /dev is fine.
+# explicit list of member disks by kernel name (no glob/eval). install records
+# each disk's /dev/disk/by-id link in the manifest ([disks.ids]), so the members
+# are still found after the kernel renames them on a later boot.
 members = ["vda", "vdb", "vdc", "vdd"]
+# dm-crypt mapper names: "kernel" (vda3_crypt, frozen at install) or "index"
+# (raiden0_crypt, by member position).
+crypt_names = "kernel"
 
 [raid]
 # stack identifier, one of:

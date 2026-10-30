@@ -3,6 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const STACK_MD_LVM_EXT4: &str = "dm-crypt~md~lvm~ext4";
@@ -78,7 +79,35 @@ pub struct Install {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Disks {
+    // member labels: the kernel names chosen at install. they key everything else
+    // (mapper names, header backups, --disks) and never change, even when the
+    // kernel later hands the same name to a different disk.
     pub members: Vec<String>,
+    // dm-crypt mapper naming: "kernel" keeps the install-time partition name
+    // (nvme0n1p3_crypt); "index" names by member position (raiden0_crypt).
+    pub crypt_names: CryptNames,
+    // member label -> stable /dev/disk/by-id link, recorded at install/replace so a
+    // member is found by identity rather than by its (unstable) kernel name.
+    pub ids: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CryptNames {
+    #[default]
+    Kernel,
+    Index,
+}
+
+impl Disks {
+    /// the ids of the current members only (a replaced disk's id is dropped). pure.
+    pub fn member_ids(&self) -> BTreeMap<String, String> {
+        self.ids
+            .iter()
+            .filter(|(k, _)| self.members.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -292,6 +321,7 @@ impl Config {
         }
         if let Some(v) = &o.disks {
             self.disks.members = v.clone();
+            self.disks.ids = self.disks.member_ids();
         }
         if let Some(v) = &o.release {
             self.install.release = v.clone();
@@ -331,6 +361,14 @@ impl Config {
         for d in &self.disks.members {
             if !seen.insert(d) {
                 bail!("disks.members contains duplicate {d:?}");
+            }
+        }
+        for (label, id) in &self.disks.ids {
+            if !self.disks.members.contains(label) {
+                bail!("disks.ids has {label:?}, which is not a member");
+            }
+            if !id.starts_with('/') {
+                bail!("disks.ids.{label} must be an absolute path, got {id:?}");
             }
         }
 

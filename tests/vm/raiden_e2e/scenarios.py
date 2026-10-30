@@ -9,9 +9,15 @@ harness's order."""
 from __future__ import annotations
 
 import os
+import re
+import time
 
+from .domain import disk_serial
 from .log import log
 from .report import FAIL, INFO, PASS, WARN
+
+POLL_SECONDS = 2
+POWEROFF_POLLS = 150
 
 WORKDIR = "/srv/raiden"
 RAIDEN = f"{WORKDIR}/raiden"
@@ -45,6 +51,12 @@ def _array_check_names(stack: str) -> list[str]:
 def _detected(text: str) -> bool:
     low = text.lower()
     return any(k in low for k in DETECT_KEYWORDS)
+
+
+def _doctor_status(out: str, name: str) -> str:
+    """the status doctor's table gives the named check, or "absent"."""
+    m = re.search(rf"^{re.escape(name)}\s+(ok|warn|fail|fixed)\s", out, re.MULTILINE)
+    return m.group(1) if m else "absent"
 
 
 class Session:
@@ -113,6 +125,23 @@ class Session:
         self.c.login("root", self.cfg.root_password)
         # record whether this boot needed the manual mount-o-degraded follow-through.
         self.reboot_used_initramfs = self.c.initramfs_recoveries > before
+        self.mount_payload()
+
+    def restart(self, disks: list[tuple[str, str]] | None = None) -> None:
+        """power the guest off and boot a new domain, optionally with the member
+        images in different slots. a guest reboot keeps the device layout, so a
+        rename needs a full power cycle, as on real hardware."""
+        log("powering off for a cold boot")
+        self.c.child.sendline("poweroff")
+        for _ in range(POWEROFF_POLLS):
+            if self.vm.domstate() in ("", "shut off"):
+                break
+            time.sleep(POLL_SECONDS)
+        self.vm.destroy()
+        self.vm.start(disks=disks)
+        self.c.reconnect()
+        self.c.unlock(self.cfg.password)
+        self.c.login("root", self.cfg.root_password)
         self.mount_payload()
 
     def grade_reboot(self, scenario: str, ok_detail: str) -> None:
@@ -244,10 +273,10 @@ def doctor(s: Session) -> None:
     # every check category must be present (none silently skipped) -- the
     # enumeration lives here, in the controlled vm, rather than against a dev host.
     names = [
-        "disk presence", "boot mount", "mount consistency", "fstab", "boot uuid",
+        "member ids", "disk presence", "boot mount","mount consistency", "fstab", "boot uuid",
         "esp uuid", "crypttab", "luks headers", "luks backup",
         *_array_check_names(s.cfg.stack), "boot mirrors",
-        "boot drift", "boot bootloader", "esp bootloader", "grub", "initrd",
+        "boot drift", "boot bootloader", "esp bootloader", "grub", "initrd", "initrd crypttab",
         "recover hook", "recover",
         "kernel hooks", "esp hook", "efibootmgr", "debconf", "manifest",
     ]
@@ -441,6 +470,42 @@ def doctor_fix(s: Session) -> None:
     s.report.add(scen, "post-fix doctor", PASS if "not shared" not in out else FAIL, _tail(out))
 
 
+def member_rename(s: Session) -> None:
+    """move the first two member images between slots and cold boot, so the guest
+    kernel names each after the other (vda <-> vdb), as nvme names drift across
+    boots on real hardware. raiden must keep addressing each member by its by-id
+    link: doctor stays clean, a bare kernel name that now means another member is
+    refused, and replace by by-id link targets the physical disk."""
+    scen = "member rename"
+    a, b = s.members()[:2]
+    (slot_a, img_a), (slot_b, img_b) = s.vm.disks[:2]
+    link = f"/dev/disk/by-id/virtio-{disk_serial(img_a)}"
+    s.restart([(slot_a, img_b), (slot_b, img_a), *s.vm.disks[2:]])
+    try:
+        _, out = s.c.run(f"readlink -f {link}", timeout=30)
+        moved = out.strip().endswith(f"/dev/{b}")
+        s.report.add(scen, "renamed", PASS if moved else FAIL, f"{link} -> {out.strip()}")
+
+        rc, out = s.raiden("doctor")
+        for name in ("disk presence", "crypttab", "member ids"):
+            st = _doctor_status(out, name)
+            s.report.add(scen, f"doctor {name}", PASS if st == "ok" else FAIL, st)
+        s.report.add(scen, "doctor", PASS if rc == 0 else FAIL, _tail(out))
+
+        rc, out = s.raiden(f"replace --dry-run --disks {a} --esp --boot")
+        refused = rc != 0 and "ambiguous" in out
+        s.report.add(scen, "ambiguous name", PASS if refused else FAIL, _tail(out))
+
+        rc, out = s.raiden(f"replace --dry-run --disks {link} --esp --boot")
+        mkfs = [line for line in out.splitlines() if "mkfs" in line]
+        right = rc == 0 and mkfs and all(f"/dev/{b}" in line for line in mkfs)
+        s.report.add(scen, "replace by id", PASS if right else FAIL, " / ".join(mkfs) or _tail(out))
+    finally:
+        s.restart()
+    rc, out = s.raiden("doctor")
+    s.report.add(scen, "restored", PASS if rc == 0 else FAIL, _tail(out))
+
+
 # every in-place scenario, in run order. selectable individually with --scenario.
 INPLACE = [
     sysbench,
@@ -452,6 +517,7 @@ INPLACE = [
     doctor,
     sync_mirrors,
     doctor_fix,
+    member_rename,
 ]
 
 # the default bundled run is resilience-only: the sysbench benchmark is opt-in
@@ -468,6 +534,7 @@ DEFAULT_INPLACE = [
     doctor,
     sync_mirrors,
     doctor_fix,
+    member_rename,
 ]
 
 # the livecd rescue flow (corrupt 4/4 + recover) is selectable by this name too.

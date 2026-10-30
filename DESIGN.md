@@ -41,6 +41,43 @@ raiden replaces that with three typed layers:
 precedence for install-time config, lowest to highest: defaults, file, env,
 flags.
 
+## disk identity
+
+kernel disk names are not stable: nvme controllers probe asynchronously, so
+`nvme0n1` and `nvme1n1` can swap between boots with no hardware change. a member
+is therefore three things:
+
+- its label (`disks.members`): the kernel name chosen at install. labels never
+  change; they key mapper names, luks header backups, `--disks`, and efibootmgr
+  entry labels.
+- its stable id (`disks.ids`): the udev `/dev/disk/by-id` link, recorded at
+  install (`disk_id::record_ids`, preferring the model_serial link over wwn/eui)
+  and for each `replace --with` disk.
+- its node: the kernel name the id resolves to now. `Layout::derive` resolves
+  each id once (`disk_id::kernel_name_of`), and `disk`/`part` address that node,
+  so every command and every comparison against findmnt/blkid output uses this
+  boot's names. an id that does not resolve (disk gone) is addressed by its own
+  path (`<id>-part<n>`), which does not exist, so a missing member can never alias
+  another disk. a member without an id (a virtio disk with no serial) is its own
+  node, as before.
+
+mapper names stay frozen at the install-time partition name (`nvme0n1p3_crypt`)
+by default, so crypttab is unaffected by renames; `disks.crypt_names = "index"`
+names them by slot (`raiden0_crypt`) instead, and a `replace --with` disk inherits
+its slot's name (`Layout::with_retired` lets the outgoing label resolve the same
+slot). dm-integrity devices are the exception: the boot-time udev rule names them
+`%k_int`, so `int_name` follows the current node. `--disks` arguments go through
+`Layout::member_for`, which accepts a label, a current node, or an id path, and
+refuses a label that is now another member's node (either reading could be the
+wrong physical disk).
+
+installs that predate ids are migrated by doctor: it derives each missing id from
+crypttab (mapper name -> luks uuid -> partition -> parent disk -> by-id), judges
+every other check against that proposed layout (so no fix acts on a renamed
+disk), and `--fix` records the ids in the manifest. any fix that changes what the
+initrd carries (member ids, crypttab) then rebuilds every initrd, syncs /boot, and
+reads each initrd's `cryptroot/crypttab` back to confirm it unlocks every member.
+
 ## init
 
 `raiden init` (src/init.rs) writes a starter `raiden.toml` so onboarding on real
@@ -217,9 +254,10 @@ so the array could not assemble. these uuids are read from the running system, s
 `replace --disks=a --with=c` is a physical disk swap: `a` is detached
 (best-effort -- it may be gone) and never wiped, `c` is wiped + provisioned +
 re-added, and the manifest's `members` is mutated (`a`->`c`, paired by position;
-the primary stays primary). the new disk adopts the old disk's esp/luks identity
-(the shared esp uuid, the shared /boot uuid) so fstab stays valid. the
-crypt mapper names change with the member names, so `/etc/crypttab` is
+the primary stays primary), with the new disk's by-id link recorded in
+`disks.ids` and the old one dropped. the new disk adopts the old disk's esp/luks
+identity (the shared esp uuid, the shared /boot uuid) so fstab stays valid. the
+default (kernel) crypt mapper names change with the member labels, so `/etc/crypttab` is
 regenerated (the per-member crypt stacks rewrite it from the swapped layout;
 md_integrity's crypttab references the md array uuid, unchanged by a member
 swap). the old luks uuid is NOT preserved on a swap (the crypttab rewrite uses
@@ -413,6 +451,7 @@ src/
   init.rs       `raiden init`: discover disks + generate a starter config
   layout.rs     derived device/mount layout (pure)
   manifest.rs    install manifest (full config + discovered uuids)
+  disk_id.rs     stable disk identity: by-id link discovery and resolution to the current kernel node
   step.rs       Step actions, the runner (dry-run + checkpointed execution)
   checkpoint.rs resume cursor + config fingerprint
   prompt.rs     interactive password (echo off) and confirmation

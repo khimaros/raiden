@@ -138,8 +138,8 @@ impl ReplaceParts {
 /// are the new disks. the old disks are detached best-effort (they may be gone)
 /// and are NOT wiped; the new disks are wiped + provisioned. the layout passed in
 /// already reflects the swap (members mutated), so device derivation targets the
-/// new disks; the old disks' partition/crypt paths are derived by name (Layout's
-/// part/crypt_name are pure functions of the disk name, not the members list).
+/// new disks; the old disks keep their recorded ids (for their devices) and are
+/// retired into their slot (for index mapper names, shared with the new disk).
 pub fn replace(
     cfg: &Config,
     layout: &Layout,
@@ -148,6 +148,8 @@ pub fn replace(
     parts: &ReplaceParts,
     with: Option<&[(String, String)]>,
 ) -> Result<Vec<Phase>> {
+    let retired = layout.with_retired(with.unwrap_or_default());
+    let layout = &retired;
     check_members(layout, disks)?;
     let healthy: Vec<String> = layout
         .members
@@ -414,7 +416,7 @@ fn partition_replacements(
         }
     };
     for d in disks {
-        let dev = format!("/dev/{d}");
+        let dev = layout.disk(d);
         if parts.full() {
             s.push(Step::run_owned(
                 format!("zap gpt on {dev}"),
@@ -500,7 +502,7 @@ fn repopulate_boot(
             ));
             s.push(Step::run_owned(
                 format!("register efi boot entry for {d}"),
-                crate::efi::register_argv(d),
+                crate::efi::register_argv(&layout.disk(d), d),
             ));
         }
     } else if !efi && (parts.esp || parts.boot) {
@@ -509,7 +511,7 @@ fn repopulate_boot(
         for d in disks {
             s.push(Step::run_owned(
                 format!("install grub to {d}"),
-                vec!["grub-install".to_string(), format!("/dev/{d}")],
+                vec!["grub-install".to_string(), layout.disk(d)],
             ));
         }
     }

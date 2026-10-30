@@ -262,7 +262,7 @@ pub fn prepare_phase() -> Phase {
 pub fn partition_phase(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Phase {
     let mut s = vec![Step::run_owned("wipe filesystem signatures", {
         let mut a = strs(&["wipefs", "-a"]);
-        a.extend(layout.members.iter().map(|d| format!("/dev/{d}")));
+        a.extend(layout.members.iter().map(|d| layout.disk(d)));
         a
     })];
     s.extend(partition_disks(layout, cfg.install.boot_mode == "efi"));
@@ -274,7 +274,7 @@ pub fn partition_phase(cfg: &Config, layout: &Layout, stack: &dyn Stack) -> Phas
 fn partition_disks(layout: &Layout, efi: bool) -> Vec<Step> {
     let mut s = Vec::new();
     for d in &layout.members {
-        let dev = format!("/dev/{d}");
+        let dev = layout.disk(d);
         s.push(Step::run_owned(
             format!("zap gpt on {dev}"),
             strs(&["sgdisk", "--zap-all"])
@@ -594,7 +594,7 @@ pub fn bootloader_phase(cfg: &Config, layout: &Layout) -> Phase {
         let devices = layout
             .members
             .iter()
-            .map(|d| format!("/dev/{d}"))
+            .map(|d| layout.disk(d))
             .collect::<Vec<_>>()
             .join(", ");
         s.push(Step::sh(
@@ -607,7 +607,7 @@ pub fn bootloader_phase(cfg: &Config, layout: &Layout) -> Phase {
             s.push(
                 Step::run_owned(
                     format!("install grub to {d}"),
-                    vec!["grub-install".to_string(), format!("/dev/{d}")],
+                    vec!["grub-install".to_string(), layout.disk(d)],
                 )
                 .chroot(),
             );
@@ -744,7 +744,7 @@ fn bootloader_efi(layout: &Layout) -> Vec<Step> {
         s.push(
             Step::run_owned(
                 format!("register efi boot entry for {d}"),
-                crate::efi::register_argv(d),
+                crate::efi::register_argv(&layout.disk(d), d),
             )
             .chroot(),
         );

@@ -3,6 +3,7 @@ mod benchmark;
 mod checkpoint;
 mod cli;
 mod config;
+mod disk_id;
 mod doctor;
 mod efi;
 mod init;
@@ -113,9 +114,9 @@ fn main() -> Result<()> {
         } => cmd_replace(g, &overrides, disks, with, *esp, *boot, *root),
         Command::Remove { disks } => {
             require_installed(g)?;
-            let d = config::split_disks(disks);
-            let scope = format!("disks={}", d.join(","));
             let (cfg, stack) = resolve_op(g, &overrides)?;
+            let d = member_labels(&Layout::derive(&cfg), disks)?;
+            let scope = format!("disks={}", d.join(","));
             run_op(
                 g,
                 &cfg,
@@ -137,6 +138,15 @@ fn overrides_from(g: &Global) -> Overrides {
         disks: g.members.as_deref().map(config::split_disks),
         release: g.release.clone(),
     }
+}
+
+/// map a comma-separated --disks argument (labels, current kernel names, or
+/// by-id paths) to member labels, refusing anything ambiguous or unknown.
+fn member_labels(layout: &Layout, disks: &str) -> Result<Vec<String>> {
+    config::split_disks(disks)
+        .iter()
+        .map(|a| layout.member_for(a))
+        .collect()
 }
 
 /// operations resolve config from the install manifest when present, falling
@@ -182,12 +192,15 @@ fn cmd_install(g: &Global, overrides: &Overrides, args: &InstallArgs) -> Result<
     // with a config file, install from it; without one, generate a config for this
     // machine (discover disks + stack-correct crypt) so `raiden install` is a
     // single command from a bare live environment.
-    let cfg = if g.config.exists() {
+    let mut cfg = if g.config.exists() {
         Config::load(&g.config, overrides)?
     } else {
         let interactive = !g.yes && std::io::stdin().is_terminal();
         init::generate(overrides, None, interactive)?
     };
+    // the kernel names are right for this boot only; record each member's stable
+    // id so the installed system finds it after the kernel renames it.
+    disk_id::record_ids(&mut cfg.disks);
     cfg.validate()?;
     let layout = Layout::derive(&cfg);
     let stack = stack::select(&cfg.raid.stack)?;
@@ -257,13 +270,21 @@ fn cmd_replace(
     cfg.validate()?;
     let stack = stack::select(&cfg.raid.stack)?;
     let parts = ops::ReplaceParts::from_flags(esp, boot, root);
-    let d = config::split_disks(disks);
+    let layout = Layout::derive(&cfg);
+    let d = member_labels(&layout, disks)?;
 
     // --with: a physical swap. build the (old, new) pairs and mutate the config's
-    // members so the plan (and the saved manifest) reference the new disks.
+    // members so the plan (and the saved manifest) reference the new disks. a new
+    // disk is labelled by its current kernel name and recorded by its stable id.
     let swap: Option<Vec<(String, String)>> = match with {
         Some(w) => {
-            let new_disks = config::split_disks(w);
+            let new_disks: Vec<String> = config::split_disks(w)
+                .iter()
+                .map(|a| {
+                    disk_id::kernel_name_of(a)
+                        .unwrap_or_else(|| a.trim_start_matches("/dev/").into())
+                })
+                .collect();
             if new_disks.len() != d.len() {
                 bail!(
                     "--disks has {} entr{{y,ies}} but --with has {}; they must pair 1:1",
@@ -271,17 +292,15 @@ fn cmd_replace(
                     new_disks.len()
                 );
             }
-            for old in &d {
-                if !cfg.disks.members.contains(old) {
-                    bail!("{old:?} is not a configured member disk");
-                }
-            }
             for new in &new_disks {
-                if cfg.disks.members.contains(new) {
-                    bail!("{new:?} is already a member; --with names new disks");
-                }
                 if d.contains(new) {
                     bail!("{new:?} appears in both --disks and --with");
+                }
+                if layout.member_for(new).is_ok() {
+                    bail!("{new:?} is already a member; --with names new disks");
+                }
+                if let Some(id) = disk_id::by_id_for(new) {
+                    cfg.disks.ids.insert(new.clone(), id);
                 }
             }
             let pairs: Vec<(String, String)> =
@@ -583,8 +602,7 @@ fn cmd_doctor(g: &Global, overrides: &Overrides, args: &DoctorArgs) -> Result<()
     require_installed(g)?;
     let cfg = resolve_config(g, overrides)?;
     cfg.validate()?;
-    let layout = Layout::derive(&cfg);
-    doctor::run(&cfg, &layout, g.verbose, args.fix, g.yes, g.dry_run)
+    doctor::run(&cfg, g.verbose, args.fix, g.yes, g.dry_run)
 }
 
 /// `raiden recover`: bring a degraded root online from the initramfs (or a livecd)
@@ -613,7 +631,14 @@ fn cmd_devices(g: &Global, overrides: &Overrides) -> Result<()> {
     println!("configured member disks:");
     for d in &layout.members {
         println!(
-            "  {d}: esp {}, boot {}, root {}",
+            "  {d}: now {} ({}), crypt {}, esp {}, boot {}, root {}",
+            layout.disk(d),
+            cfg.disks
+                .ids
+                .get(d)
+                .map(String::as_str)
+                .unwrap_or("no stable id"),
+            layout.crypt_name(d),
             layout.part(d, 1),
             layout.part(d, 2),
             layout.part(d, 3)

@@ -22,19 +22,20 @@ pub const GRUB_DEBCONF: &[(&str, &str)] = &[
 ];
 
 /// the efibootmgr argv that registers one member disk's per-disk shim boot entry:
-/// `efibootmgr -c -g -d /dev/<disk> -p 1 -L debian-<disk> -l <shim>`. shared by
+/// `efibootmgr -c -g -d <dev> -p 1 -L debian-<label> -l <shim>`, where dev is the
+/// member's current disk node and label its stable member label. shared by
 /// install, replace, and doctor --fix so all three register identically.
-pub fn register_argv(disk: &str) -> Vec<String> {
+pub fn register_argv(dev: &str, label: &str) -> Vec<String> {
     vec![
         "efibootmgr".into(),
         "-c".into(),
         "-g".into(),
         "-d".into(),
-        format!("/dev/{disk}"),
+        dev.to_string(),
         "-p".into(),
         "1".into(),
         "-L".into(),
-        format!("debian-{disk}"),
+        format!("debian-{label}"),
         "-l".into(),
         SHIM_LOADER.into(),
     ]

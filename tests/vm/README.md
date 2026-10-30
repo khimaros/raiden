@@ -106,6 +106,10 @@ defaults are small.
    exercises `doctor --fix` end to end -- reinstalls a removed kernel hook, and
    detects/declines/re-stamps a mirror esp whose fs uuid was skewed off the shared
    one (the legacy-host esp-uuid migration; `--yes` accepts, no-flag declines).
+   `member_rename` cold boots with two member images swapped between slots (each
+   disk carries a serial, so its by-id link follows the image) and checks that
+   doctor stays clean, a kernel name that now means another member is refused,
+   and replace by by-id link targets the physical disk.
 4. 4/4 corruption + `raiden rescue` from the livecd.
 5. boot/esp destruction (`corrupt_efiboot`), run separately on a fresh install
    (`make test-vm-boot`) so its boot result is not confounded by the above.

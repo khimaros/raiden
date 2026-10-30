@@ -135,7 +135,11 @@ the new disk is wiped + provisioned + re-added, and the manifest's member list i
 mutated (`a`->`c`). the new disk adopts the old disk's esp/luks identity (the
 shared esp uuid, the shared /boot uuid) so fstab stays valid; crypttab is
 regenerated for the new crypt names. `--with` is optional -- without it, replace
-is the in-place rebuild. `raiden mount` brings
+is the in-place rebuild. `--disks` names a member by its label (the kernel name
+it had at install), by its current kernel name, or by its `/dev/disk/by-id` path;
+a name that is one member's label but another member's current kernel name is
+refused as ambiguous -- use the by-id path (`raiden devices` shows the mapping).
+`raiden mount` brings
 the stack up from the first available member (the primary ESP mounts at `/boot/efi`;
 mirrors are synced transiently), so a lost-primary system stays serviceable until a
 `replace`. `rescue`, `mount`, and `close` are the livecd flow -- they resolve from a
@@ -179,12 +183,14 @@ config keys (`size`, `passes`, `rndwr_events`, `seqwr_events`) or the matching
 flags.
 
 `raiden doctor` walks the installed system and reports the health of each layer
-the manifest says should be present: disk presence, /boot + /boot/efi mounts
+the manifest says should be present: member ids (each member recorded by a
+stable by-id link), disk presence, /boot + /boot/efi mounts
 (and a note when they sit on different disks -- expected, since both mount by
 a shared fs uuid),
-fstab + crypttab, luks headers, array status (md/zfs/btrfs), boot + esp mirror
+fstab + crypttab (each member's entry found by its luks uuid, so a kernel rename
+does not flag a correct crypttab), luks headers, array status (md/zfs/btrfs), boot + esp mirror
 presence AND drift (a present-but-never-synced mirror is a silent failure),
-grub install, initrd (that it carries the boot/recovery binaries -- decrypt_keyctl
+grub install, initrd (that each initrd's crypttab unlocks every member, that it carries the boot/recovery binaries -- decrypt_keyctl
 + keyctl, cryptsetup, and the stack's assemble/mount tools; and, when
 `install.initramfs_recovery` is on, that raiden + the manifest are baked in for
 `raiden recover`), the boot-mirror kernel
@@ -221,6 +227,15 @@ re-stamp, before running it on hardware. each applied fix is reported as a
 `fixed` status row. drift and uuid divergence are warns (the system still boots
 from the primary); destructive checks (fstab, crypttab, luks, array state,
 grub-install) are never auto-fixed.
+
+kernel disk names are not stable across boots (nvme controllers probe
+asynchronously), so raiden records each member's `/dev/disk/by-id` link in the
+manifest (`[disks.ids]`) and finds the disk through it. on an install that
+predates this, doctor derives the ids from crypttab's luks uuids and judges every
+check against them; `doctor --fix` records them in the manifest, rebuilds every
+initrd, runs `raiden sync boot`, and reads each initrd's crypttab back to confirm
+it unlocks every member. the crypttab fix runs the same rebuild + sync + verify
+after rewriting crypttab (and renames the open mappings to match).
 
 introspection:
 
@@ -281,7 +296,16 @@ assemble. the copies are kept in sync automatically on kernel changes. set
 `[boot] raid = true` to use the legacy md raid1 `/boot` instead (`boot.level`
 applies only in that mode).
 
-after install, the resolved truth (stack, level, members, and the chosen
+dm-crypt mapper names default to each member's install-time partition name
+(`nvme0n1p3_crypt`) and keep it even after the kernel renames the disk. set
+`[disks] crypt_names = "index"` to name them by member position instead
+(`raiden0_crypt`, `raiden1_crypt`, ...); a disk swapped in by `replace --with`
+then takes over its slot's name. switching an installed system means editing the
+manifest, then `raiden doctor --fix` rewrites crypttab, renames the open mappings,
+and rebuilds + verifies the initrds.
+
+after install, the resolved truth (stack, level, members and their by-id links,
+and the chosen
 partition/luks/esp UUIDs) is written to `/boot/raiden/manifest.toml` (canonical)
 and mirrored to `/etc/raiden/manifest.toml`. /boot is canonical so a livecd can
 read it by mounting a member's /boot without unlocking the root fs. post-install

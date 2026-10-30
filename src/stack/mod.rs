@@ -274,7 +274,7 @@ pub fn create_root_partitions(cfg: &Config, layout: &Layout) -> Vec<Step> {
         .members
         .iter()
         .map(|d| {
-            let dev = format!("/dev/{d}");
+            let dev = layout.disk(d);
             // sgdisk -E is the last usable sector; round (end+1) down to a whole
             // number of sector-size blocks. spb==1 (512) reduces to the disk end.
             Step::sh(

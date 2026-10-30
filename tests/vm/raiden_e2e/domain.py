@@ -13,8 +13,18 @@ console (raiden's serial_console option), which the harness uses thereafter."""
 from __future__ import annotations
 
 import html
+from pathlib import Path
 
 from .config import VMConfig
+
+# each disk's serial is derived from its backing image, not its target slot, so
+# the guest's /dev/disk/by-id/virtio-<serial> link follows the image when the
+# member_rename scenario moves images between slots (and kernel names).
+DISK_SERIAL_PREFIX = "raiden-"
+
+
+def disk_serial(path: str) -> str:
+    return DISK_SERIAL_PREFIX + Path(path).stem
 
 
 # cache="none" (O_DIRECT) is required for the truncate-disk scenario: the harness
@@ -26,6 +36,7 @@ def _disk(dev: str, path: str, order: int) -> str:
       <driver name="qemu" type="raw" cache="none"/>
       <source file="{html.escape(path)}"/>
       <target dev="{dev}" bus="virtio"/>
+      <serial>{disk_serial(path)}</serial>
       <boot order="{order}"/>
     </disk>"""
 

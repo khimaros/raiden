@@ -921,3 +921,111 @@ def test_bios_grub_install_is_noninteractive(raiden):
     assert "grub-pc/install_devices" in out  # preseeded, not prompted
     assert "dpkg-reconfigure" not in out  # no interactive reconfigure
     assert "grub-install /dev/vda" in out  # explicit per-disk install
+
+
+def _renamed_nvme_config(tmp_path, extra=""):
+    """two nvme members whose kernel names swapped since install, simulating udev:
+    each member's stable id is a symlink to the node it resolves to NOW. member
+    nvme0n1 (labelled at install) is currently /dev/nvme1n1 and vice versa."""
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    ids = {}
+    for label, now, serial in [("nvme0n1", "nvme1n1", "S1AAA"), ("nvme1n1", "nvme0n1", "S2BBB")]:
+        (dev / now).touch()
+        link = dev / f"nvme-Fake_SSD_{serial}"
+        link.symlink_to(dev / now)
+        ids[label] = str(link)
+    p = tmp_path / "nvme.toml"
+    p.write_text(
+        '[disks]\nmembers = ["nvme0n1", "nvme1n1"]\n'
+        f"{extra}"
+        "[disks.ids]\n"
+        + "".join(f'{k} = "{v}"\n' for k, v in ids.items())
+        + '[raid]\nstack = "dm-crypt~md~lvm~ext4"\nlevel = "1"\n'
+    )
+    return str(p), ids
+
+
+def test_member_ids_follow_the_disk_across_kernel_renames(raiden, tmp_path):
+    # nvme kernel names follow async probe order, so they move between boots. a
+    # member is resolved through its stable id to whatever node it has NOW, while
+    # its mapper name stays the one baked into crypttab at install.
+    cfg, _ = _renamed_nvme_config(tmp_path)
+    out = raiden("rescue", "--dry-run", "--config", cfg).stdout
+    assert "cryptsetup luksOpen /dev/nvme1n1p3 nvme0n1p3_crypt" in out
+    assert "cryptsetup luksOpen /dev/nvme0n1p3 nvme1n1p3_crypt" in out
+
+
+def test_absent_member_id_never_aliases_another_disk(raiden, tmp_path):
+    # a member whose stable id no longer resolves (disk pulled or dead) must not
+    # fall back to its install-time kernel name, which may now be another disk.
+    cfg, ids = _renamed_nvme_config(tmp_path)
+    gone = ids["nvme0n1"]
+    (tmp_path / "dev" / "nvme-Fake_SSD_S1AAA").unlink()
+    out = raiden("rescue", "--dry-run", "--config", cfg).stdout
+    assert f"cryptsetup luksOpen {gone}-part3 nvme0n1p3_crypt" in out
+    assert "luksOpen /dev/nvme1n1p3" not in out
+
+
+def test_index_crypt_names_are_opt_in(raiden, tmp_path):
+    cfg, _ = _renamed_nvme_config(tmp_path, extra='crypt_names = "index"\n')
+    out = raiden("rescue", "--dry-run", "--config", cfg).stdout
+    assert "cryptsetup luksOpen /dev/nvme1n1p3 raiden0_crypt" in out
+    assert "cryptsetup luksOpen /dev/nvme0n1p3 raiden1_crypt" in out
+    plan = raiden("install", "--dry-run", "--config", cfg).stdout
+    assert 'echo "raiden0_crypt UUID=$uuid' in plan
+
+
+def test_replace_targets_the_member_by_stable_id(raiden, tmp_path):
+    # --disks may name a member by its stable id; the plan acts on the node that
+    # member has now, never on its stale install-time kernel name.
+    cfg, ids = _renamed_nvme_config(tmp_path)
+    out = raiden(
+        "replace", "--dry-run", "--config", cfg, "--disks", ids["nvme0n1"]
+    ).stdout
+    assert "sgdisk --zap-all /dev/nvme1n1" in out
+    assert "sgdisk --zap-all /dev/nvme0n1" not in out
+    assert "cryptsetup luksOpen /dev/nvme1n1p3 nvme0n1p3_crypt" in out
+
+
+def test_replace_rejects_a_kernel_name_that_moved_to_another_member(raiden, tmp_path):
+    # "nvme0n1" is one member's label but another member's current kernel name;
+    # guessing would rebuild the wrong physical disk, so it must be refused.
+    cfg, _ = _renamed_nvme_config(tmp_path)
+    r = raiden(
+        "replace", "--dry-run", "--config", cfg, "--disks", "nvme0n1",
+        expect_ok=False,
+    )
+    assert r.returncode != 0
+    assert "ambiguous" in r.stderr
+
+
+def test_replace_with_keeps_the_index_crypt_name(raiden, tmp_path):
+    # with index names a swapped-in disk takes over its slot's mapper name, so the
+    # old mapping is closed and the new disk opened under the same name.
+    p = tmp_path / "index.toml"
+    p.write_text(
+        '[disks]\nmembers = ["vda", "vdb", "vdc", "vdd"]\ncrypt_names = "index"\n'
+        '[raid]\nstack = "dm-crypt~md~lvm~ext4"\nlevel = "6"\n'
+    )
+    out = raiden(
+        "replace", "--dry-run", "--config", str(p), "--disks", "vdb", "--with", "sde"
+    ).stdout
+    assert "cryptsetup luksClose raiden1_crypt" in out
+    assert "cryptsetup luksOpen /dev/sde3 raiden1_crypt" in out
+    assert "raiden1_crypt UUID=$uuid" in out
+
+
+@pytest.mark.parametrize(
+    "disks, err",
+    [
+        ('members = ["vda"]\ncrypt_names = "serial"\n', "crypt_names"),
+        ('members = ["vda"]\n[disks.ids]\nvdb = "/dev/disk/by-id/x"\n', "not a member"),
+    ],
+)
+def test_config_validate_rejects_bad_disk_identity(raiden, tmp_path, disks, err):
+    p = tmp_path / "bad.toml"
+    p.write_text(f'[disks]\n{disks}[raid]\nstack = "dm-crypt~md~lvm~ext4"\nlevel = "1"\n')
+    r = raiden("config", "validate", "--config", str(p), expect_ok=False)
+    assert r.returncode != 0
+    assert err in r.stderr

@@ -6,6 +6,7 @@
 // own check and the rest still run. exit 0 iff every check passes, non-zero if
 // any fail.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -16,6 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::cli::{BootSyncArgs, EfiSyncArgs, SyncTarget};
 use crate::config::{Config, Family};
+use crate::disk_id;
 use crate::efi;
 use crate::layout::{Layout, BOOT_MD_DEVICE, ESP_MOUNT};
 use crate::manifest::Manifest;
@@ -28,6 +30,8 @@ const OK: &str = "ok";
 const WARN: &str = "warn";
 const FAIL: &str = "fail";
 const FIXED: &str = "fixed";
+
+const CRYPTTAB_PATH: &str = "/etc/crypttab";
 
 /// which mirror set a uuid re-stamp targets.
 #[derive(Clone, Copy)]
@@ -57,8 +61,12 @@ enum Fix {
     Debconf,
     /// append the missing /boot or /boot/efi fstab entry.
     Fstab,
-    /// regenerate /etc/crypttab from the layout (the stack's crypttab_regen).
+    /// regenerate /etc/crypttab from the layout (the stack's crypttab_regen), rename
+    /// the open mappings to match, and rebuild + sync + verify the initrds.
     Crypttab,
+    /// record the members' discovered stable ids in the manifest, then rebuild +
+    /// sync + verify the initrds (they bake the manifest for recovery).
+    MemberIds,
     /// re-run grub-install on the primary esp (named + removable).
     GrubInstall,
     /// rebuild the initramfs so it carries cryptsetup (update-initramfs -u).
@@ -87,7 +95,8 @@ impl Fix {
             }
             Fix::Debconf => "re-set grub-efi debconf (removable fallback on, grub nvram off)",
             Fix::Fstab => "append the missing fstab entry",
-            Fix::Crypttab => "regenerate /etc/crypttab from the layout",
+            Fix::Crypttab => "regenerate /etc/crypttab and rebuild the initramfs",
+            Fix::MemberIds => "record the members' stable ids and rebuild the initramfs",
             Fix::GrubInstall => "re-run grub-install on the primary esp",
             Fix::Initrd => "rebuild the initramfs (update-initramfs -u)",
             Fix::RecoverBundle => "install the raiden recovery hook and rebuild the initramfs",
@@ -139,21 +148,23 @@ impl Check {
     }
 }
 
-pub fn run(
-    cfg: &Config,
-    layout: &Layout,
-    verbose: bool,
-    fix: bool,
-    yes: bool,
-    dry_run: bool,
-) -> Result<()> {
+pub fn run(cfg: &Config, verbose: bool, fix: bool, yes: bool, dry_run: bool) -> Result<()> {
     let family = cfg.family().unwrap_or(Family::Md);
     let efi = cfg.install.boot_mode == "efi";
     // the stack drives the initrd-binary check and the fixes; cfg.validate() ran in
     // cmd_doctor, so this select cannot fail on an invalid id.
     let stack = stack::select(&cfg.raid.stack)?;
+    // a manifest without stable ids (an older install) addresses members by kernel
+    // name, which may now be a different disk. derive the ids from crypttab's luks
+    // uuids and judge every check against that, so no fix acts on a renamed disk.
+    let found = discover_ids(cfg, stack.as_ref());
+    let mut cfg = cfg.clone();
+    cfg.disks.ids.extend(found.clone());
+    let cfg = &cfg;
+    let layout = &Layout::derive(cfg);
     let mut checks = Vec::new();
 
+    checks.push(check_member_ids(cfg, layout, &found));
     checks.extend(check_disk_presence(layout));
     checks.extend(check_boot_mount(layout));
     checks.extend(check_mount_consistency(layout, efi));
@@ -177,7 +188,11 @@ pub fn run(
         checks.extend(check_esp_bootloader(layout));
     }
     checks.extend(check_grub(layout, efi));
-    checks.extend(check_initrd(stack.as_ref(), cfg.install.initramfs_recovery));
+    checks.extend(check_initrd(
+        stack.as_ref(),
+        layout,
+        cfg.install.initramfs_recovery,
+    ));
     checks.extend(check_kernel_hooks());
     if efi {
         checks.extend(check_efi_hook());
@@ -193,7 +208,7 @@ pub fn run(
         return Ok(());
     }
     if fix {
-        apply_fixes(&mut checks, layout, verbose, yes, stack.as_ref())?;
+        apply_fixes(&mut checks, cfg, layout, verbose, yes, stack.as_ref())?;
     }
 
     let any_fail = checks.iter().any(|c| c.status == FAIL);
@@ -254,7 +269,23 @@ fn fix_commands(fix: &Fix, layout: &Layout) -> Vec<String> {
         Fix::EfiBootEntries => efibootmgr_commands(layout),
         Fix::Debconf => debconf_commands(),
         Fix::Fstab => vec!["append the missing /boot or /boot/efi UUID= entry to /etc/fstab".into()],
-        Fix::Crypttab => vec!["regenerate /etc/crypttab from the layout".into()],
+        Fix::Crypttab => {
+            let mut c = vec![
+                format!("write {CRYPTTAB_PATH}: one entry per member, by its luks uuid"),
+                "dmsetup rename <open name> <member name>   # per misnamed open mapping".into(),
+            ];
+            c.extend(refresh_commands(layout));
+            c
+        }
+        Fix::MemberIds => {
+            let mut c = vec![format!(
+                "write [disks.ids] to {} and {}",
+                crate::manifest::BOOT_MIRROR_PATH,
+                crate::manifest::DEFAULT_PATH
+            )];
+            c.extend(refresh_commands(layout));
+            c
+        }
         Fix::GrubInstall => efi::grub_install_steps(false)
             .iter()
             .flat_map(|s| s.describe())
@@ -304,6 +335,7 @@ fn restamp_commands(kind: UuidKind, layout: &Layout) -> Vec<String> {
 /// the original status and appends the error to the detail.
 fn apply_fixes(
     checks: &mut [Check],
+    cfg: &Config,
     layout: &Layout,
     verbose: bool,
     yes: bool,
@@ -318,7 +350,7 @@ fn apply_fixes(
             c.detail = format!("{} (fix skipped)", c.detail);
             continue;
         }
-        match apply_one(&fix, layout, verbose, stack) {
+        match apply_one(&fix, cfg, layout, verbose, stack) {
             Ok(detail) => {
                 c.status = FIXED;
                 c.detail = detail;
@@ -339,13 +371,15 @@ fn first_line(detail: &str) -> &str {
 
 fn apply_one(
     fix: &Fix,
+    cfg: &Config,
     layout: &Layout,
     verbose: bool,
     stack: &dyn stack::Stack,
 ) -> Result<String> {
     match fix {
+        Fix::MemberIds => member_ids_fix(cfg, layout, stack, verbose),
         Fix::Fstab => fstab_fix(layout),
-        Fix::Crypttab => crypttab_fix(layout, stack),
+        Fix::Crypttab => crypttab_fix(layout, stack, verbose),
         Fix::GrubInstall => run_steps(efi::grub_install_steps(false), "re-ran grub-install"),
         Fix::Initrd => {
             stack::update_initramfs_u(false).execute(None)?;
@@ -481,16 +515,170 @@ fn fstab_fix(layout: &Layout) -> Result<String> {
 }
 
 /// regenerate /etc/crypttab from the layout -- the stack's crypttab_regen, the same
-/// builder replace uses. None means an array-based crypttab (md_integrity), which a
-/// member change does not affect.
-fn crypttab_fix(layout: &Layout, stack: &dyn stack::Stack) -> Result<String> {
-    match stack.crypttab_regen(layout) {
-        Some(step) => {
-            step.execute(None)?;
-            Ok("regenerated /etc/crypttab".into())
+/// builder replace uses -- then bring the running mappings and every initrd in
+/// line with it: an initrd still carrying the old crypttab is what unlocks the
+/// next boot. None means an array-based crypttab (md_integrity), which a member
+/// change does not affect.
+fn crypttab_fix(layout: &Layout, stack: &dyn stack::Stack, verbose: bool) -> Result<String> {
+    let Some(step) = stack.crypttab_regen(layout) else {
+        return Ok("crypttab is array-based; nothing to regenerate".into());
+    };
+    step.execute(None)?;
+    let renamed = rename_open_mappings(layout)?;
+    refresh_boot(layout, stack, verbose)?;
+    Ok(format!(
+        "regenerated {CRYPTTAB_PATH}, renamed {renamed} open mapping(s), rebuilt and verified the initramfs"
+    ))
+}
+
+/// record the discovered stable ids in the manifest, then rebuild the initrd
+/// (which bakes the manifest for `raiden recover`) and push it to the mirrors.
+fn member_ids_fix(
+    cfg: &Config,
+    layout: &Layout,
+    stack: &dyn stack::Stack,
+    verbose: bool,
+) -> Result<String> {
+    Manifest::from_config(cfg).save()?;
+    refresh_boot(layout, stack, verbose)?;
+    Ok(format!(
+        "recorded {} stable id(s) in the manifest, rebuilt and verified the initramfs",
+        cfg.disks.ids.len()
+    ))
+}
+
+/// rename each member's open crypt mapping to its configured name, so the running
+/// system agrees with the rewritten crypttab (dmsetup renames a live device in
+/// place). returns how many were renamed.
+fn rename_open_mappings(layout: &Layout) -> Result<usize> {
+    let mut n = 0;
+    for d in &layout.members {
+        let want = layout.crypt_name(d);
+        let Some(open) = open_mapping_of(&layout.part(d, 3)) else {
+            continue;
+        };
+        if open != want {
+            run_ok(&["dmsetup".into(), "rename".into(), open, want])?;
+            n += 1;
         }
-        None => Ok("crypttab is array-based; nothing to regenerate".into()),
     }
+    Ok(n)
+}
+
+/// the dm name of the mapping stacked directly on a partition, from sysfs holders.
+fn open_mapping_of(part: &str) -> Option<String> {
+    let k = disk_id::kernel_name_of(part)?;
+    fs::read_dir(format!("/sys/class/block/{k}/holders"))
+        .ok()?
+        .flatten()
+        .find_map(|h| fs::read_to_string(h.path().join("dm/name")).ok())
+        .map(|s| s.trim().to_string())
+}
+
+/// rebuild every initrd, push /boot to the independent mirrors, then confirm each
+/// initrd's crypttab unlocks every member -- a server whose initrd misses a member
+/// cannot assemble its array at boot, so this fails loudly rather than reporting a
+/// fix that did not take.
+fn refresh_boot(layout: &Layout, stack: &dyn stack::Stack, verbose: bool) -> Result<()> {
+    stack::update_initramfs_u(false).execute(None)?;
+    if !layout.boot_raid() {
+        let target = SyncTarget::Boot(BootSyncArgs { force: false });
+        sync::run(&target, layout, true, false, verbose, false)?;
+    }
+    let problems = initrd_crypttab_problems(layout, stack);
+    if !problems.is_empty() {
+        bail!("initrd verification failed: {}", problems.join("; "));
+    }
+    Ok(())
+}
+
+/// the commands refresh_boot runs, for the dry-run preview.
+fn refresh_commands(layout: &Layout) -> Vec<String> {
+    let mut c = stack::update_initramfs_u(false).describe();
+    if !layout.boot_raid() {
+        c.push("raiden sync boot --yes".into());
+    }
+    c.push("verify each /boot/initrd.img-*'s cryptroot/crypttab lists every member".into());
+    c
+}
+
+/// for per-member crypttab stacks, each /boot initrd whose baked crypttab lacks a
+/// member (or cannot be read). empty when all is well or the stack's crypttab is
+/// array-based.
+fn initrd_crypttab_problems(layout: &Layout, stack: &dyn stack::Stack) -> Vec<String> {
+    if stack.crypttab_regen(layout).is_none() {
+        return Vec::new();
+    }
+    let names = layout.crypt_names();
+    let mut initrds: Vec<String> = fs::read_dir("/boot")
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("initrd.img-"))
+                .map(|e| e.path().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    initrds.sort();
+    initrds
+        .iter()
+        .filter_map(|i| match sync::initrd_crypttab(i) {
+            Ok(t) => {
+                let miss = missing_crypttab_names(&t, &names);
+                (!miss.is_empty()).then(|| format!("{i} lacks {}", miss.join(", ")))
+            }
+            Err(e) => Some(e),
+        })
+        .collect()
+}
+
+/// stable ids for members the manifest has none for (an install predating them).
+/// a per-member crypttab stack maps each member through its crypttab entry: the
+/// luks uuid identifies the partition the member was installed on, whatever the
+/// kernel calls it now. md_integrity's crypttab is array-wide, so its members
+/// fall back to their current kernel name (its mapper names are kernel-derived
+/// at boot anyway).
+fn discover_ids(cfg: &Config, stack: &dyn stack::Stack) -> BTreeMap<String, String> {
+    let layout = Layout::derive(cfg);
+    let per_member = stack.crypttab_regen(&layout).is_some();
+    let crypttab = fs::read_to_string(CRYPTTAB_PATH).unwrap_or_default();
+    layout
+        .members
+        .iter()
+        .filter(|m| !cfg.disks.ids.contains_key(*m))
+        .filter_map(|m| {
+            let id = if per_member {
+                let uuid = crypttab_uuid_of(&crypttab, &layout.crypt_name(m))?;
+                let part = disk_id::kernel_name_of(&format!("/dev/disk/by-uuid/{uuid}"))?;
+                disk_id::by_id_for(&disk_id::parent_disk(&part)?)
+            } else {
+                disk_id::by_id_for(m)
+            };
+            id.map(|i| (m.clone(), i))
+        })
+        .collect()
+}
+
+/// every member is recorded by a stable id, so a kernel rename cannot point raiden
+/// at the wrong disk. `found` are ids discovered this run but not yet persisted.
+fn check_member_ids(cfg: &Config, layout: &Layout, found: &BTreeMap<String, String>) -> Check {
+    let describe = |m: &String| match cfg.disks.ids.get(m) {
+        Some(id) => format!("{m} -> {id} (now {})", layout.disk(m)),
+        None => format!("{m} (no by-id link; kernel name)"),
+    };
+    let all: Vec<String> = layout.members.iter().map(describe).collect();
+    if found.is_empty() {
+        return Check::ok("member ids", all.join("\n"));
+    }
+    let new: Vec<String> = found.keys().map(describe).collect();
+    Check::warn(
+        "member ids",
+        format!(
+            "not recorded in the manifest: {}\n{}",
+            new.join(", "),
+            all.join("\n")
+        ),
+    )
+    .with_fix(Fix::MemberIds)
 }
 
 /// re-back-up the luks headers to /boot, the same builder install uses (targeting
@@ -547,11 +735,11 @@ fn check_disk_presence(layout: &Layout) -> Vec<Check> {
         .members
         .iter()
         .map(|d| {
-            let dev = format!("/dev/{d}");
+            let dev = layout.disk(d);
             if std::path::Path::new(&dev).exists() {
-                Check::ok("disk presence", format!("{dev} present"))
+                Check::ok("disk presence", format!("{d}: {dev} present"))
             } else {
-                Check::fail("disk presence", format!("{dev} missing"))
+                Check::fail("disk presence", format!("{d}: {dev} missing"))
             }
         })
         .collect()
@@ -694,39 +882,67 @@ fn uuid_divergences(present: &[(String, String)], expected: &str) -> Vec<String>
         .collect()
 }
 
-/// each member's root partition has a crypttab entry matching its luks uuid.
+/// each member's root partition has a crypttab entry for its luks uuid, under
+/// the member's mapper name.
 fn check_crypttab(layout: &Layout) -> Vec<Check> {
-    let crypttab = std::fs::read_to_string("/etc/crypttab").unwrap_or_default();
+    let crypttab = fs::read_to_string(CRYPTTAB_PATH).unwrap_or_default();
     layout
         .members
         .iter()
         .map(|d| {
-            let name = layout.crypt_name(d);
-            let dev = layout.part(d, 3);
-            // crypttab: <name> <source> ...
-            let entry = crypttab
-                .lines()
-                .find(|l| l.split_whitespace().next() == Some(name.as_str()));
-            match entry {
-                Some(line) => {
-                    let cfg_uuid = blkid_uuid(&dev);
-                    let tab_uuid = line.split_whitespace().nth(1).unwrap_or("");
-                    let tab_uuid = tab_uuid.strip_prefix("UUID=").unwrap_or(tab_uuid);
-                    if cfg_uuid.as_deref() == Some(tab_uuid) {
-                        Check::ok("crypttab", format!("{name}: uuid matches"))
-                    } else {
-                        Check::warn(
-                            "crypttab",
-                            format!("{name}: crypttab {tab_uuid} != disk {cfg_uuid:?}"),
-                        )
-                        .with_fix(Fix::Crypttab)
-                    }
-                }
-                None => {
-                    Check::fail("crypttab", format!("no entry for {name}")).with_fix(Fix::Crypttab)
-                }
-            }
+            let uuid = blkid_uuid(&layout.part(d, 3));
+            crypttab_check(&layout.crypt_name(d), uuid.as_deref(), &crypttab)
         })
+        .collect()
+}
+
+/// (name, uuid) of each `<name> UUID=<uuid> ...` crypttab entry. pure.
+fn crypttab_entries(crypttab: &str) -> impl Iterator<Item = (&str, &str)> {
+    crypttab
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let name = f.next()?;
+            Some((name, f.next()?.strip_prefix("UUID=")?))
+        })
+}
+
+/// the luks uuid crypttab records for a mapper name. pure.
+fn crypttab_uuid_of(crypttab: &str, name: &str) -> Option<String> {
+    crypttab_entries(crypttab)
+        .find(|(n, _)| *n == name)
+        .map(|(_, u)| u.to_string())
+}
+
+/// judge one member's crypttab entry. the entry is found by the disk's luks uuid
+/// (identity), not by mapper name: a name-keyed lookup flagged a correct crypttab
+/// whenever the kernel renamed the disks. pure.
+fn crypttab_check(name: &str, uuid: Option<&str>, crypttab: &str) -> Check {
+    let Some(uuid) = uuid else {
+        return Check::warn(
+            "crypttab",
+            format!("{name}: cannot read the disk's luks uuid"),
+        );
+    };
+    match crypttab_entries(crypttab).find(|(_, u)| *u == uuid) {
+        Some((n, _)) if n == name => Check::ok("crypttab", format!("{name}: uuid matches")),
+        Some((n, _)) => Check::warn(
+            "crypttab",
+            format!("{name}: luks {uuid} is listed as {n}, expected {name}"),
+        )
+        .with_fix(Fix::Crypttab),
+        None => Check::fail("crypttab", format!("{name}: no entry for luks {uuid}"))
+            .with_fix(Fix::Crypttab),
+    }
+}
+
+/// the mapper names an initrd crypttab lacks (each would not unlock at boot). pure.
+fn missing_crypttab_names(crypttab: &str, names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| !crypttab_entries(crypttab).any(|(e, _)| e == n.as_str()))
+        .cloned()
         .collect()
 }
 
@@ -1053,7 +1269,7 @@ fn efibootmgr_fix(layout: &Layout) -> Result<String> {
         run_ok(&["efibootmgr".into(), "-b".into(), num.clone(), "-B".into()])?;
     }
     for disk in register.iter().rev() {
-        run_ok(&efi::register_argv(disk))?;
+        run_ok(&efi::register_argv(&layout.disk(disk), disk))?;
     }
     Ok(format!(
         "pruned {} stale entry(ies), registered {} member shim entry(ies)",
@@ -1098,7 +1314,7 @@ fn efibootmgr_commands(layout: &Layout) -> Vec<String> {
         register
             .iter()
             .rev()
-            .map(|d| efi::register_argv(d).join(" ")),
+            .map(|d| efi::register_argv(&layout.disk(d), d).join(" ")),
     );
     if lines.is_empty() {
         lines.push("(nothing to do: every member has a clean shim entry)".into());
@@ -1194,7 +1410,7 @@ fn debconf_commands() -> Vec<String> {
 
 /// the initrd carries the binaries needed to unlock and mount (or recover) the
 /// root, and -- when initramfs recovery is enabled -- raiden + the manifest too.
-fn check_initrd(stack: &dyn stack::Stack, recover_bundle: bool) -> Vec<Check> {
+fn check_initrd(stack: &dyn stack::Stack, layout: &Layout, recover_bundle: bool) -> Vec<Check> {
     let Some(initrd) = first_glob("/boot", "initrd.img-") else {
         return vec![Check::fail("initrd", "no initrd.img-* on /boot")];
     };
@@ -1219,6 +1435,16 @@ fn check_initrd(stack: &dyn stack::Stack, recover_bundle: bool) -> Vec<Check> {
         )
         .with_fix(Fix::Initrd)]
     };
+    // the crypttab baked into each initrd is what unlocks the members at boot; a
+    // stale one (eg. crypttab rewritten without a rebuild) misses a member.
+    if stack.crypttab_regen(layout).is_some() {
+        let problems = initrd_crypttab_problems(layout, stack);
+        out.push(if problems.is_empty() {
+            Check::ok("initrd crypttab", "every initrd unlocks every member")
+        } else {
+            Check::warn("initrd crypttab", problems.join("\n")).with_fix(Fix::Initrd)
+        });
+    }
     if recover_bundle {
         // the raiden initramfs hook is the establish mechanism: it bakes raiden +
         // the manifest into the initrd. check it is installed, executable, and
@@ -1824,5 +2050,46 @@ mod tests {
         // a substring of a present path is NOT a false positive, and a real gap is flagged.
         let m = missing_initrd_binaries(listing, &["keyctl", "mdadm"]);
         assert_eq!(m, vec!["mdadm".to_string()]);
+    }
+
+    const CRYPTTAB: &str = "# <target> <source> <key> <options>\n\
+        nvme2n1p3_crypt UUID=fca35681-aaaa none luks,initramfs\n\
+        nvme3n1p3_crypt UUID=d9620e23-bbbb none luks,initramfs\n";
+
+    #[test]
+    fn crypttab_check_matches_by_luks_uuid_not_by_kernel_name() {
+        // a correct crypttab is ok whatever node the disk has now: the entry is
+        // found by the member's luks uuid, then its name is compared.
+        let c = crypttab_check("nvme2n1p3_crypt", Some("fca35681-aaaa"), CRYPTTAB);
+        assert_eq!(c.status, OK);
+        // the right disk under the wrong mapper name is repairable drift.
+        let c = crypttab_check("raiden0_crypt", Some("fca35681-aaaa"), CRYPTTAB);
+        assert_eq!(c.status, WARN);
+        assert!(matches!(c.fix, Some(Fix::Crypttab)));
+        // a disk crypttab does not know about at all cannot unlock at boot.
+        let c = crypttab_check("nvme4n1p3_crypt", Some("0000-cccc"), CRYPTTAB);
+        assert_eq!(c.status, FAIL);
+        // an unreadable disk is reported, not "fixed" by rewriting crypttab.
+        let c = crypttab_check("nvme2n1p3_crypt", None, CRYPTTAB);
+        assert_eq!(c.status, WARN);
+        assert!(c.fix.is_none());
+    }
+
+    #[test]
+    fn crypttab_uuid_of_reads_the_named_entry() {
+        assert_eq!(
+            crypttab_uuid_of(CRYPTTAB, "nvme3n1p3_crypt").as_deref(),
+            Some("d9620e23-bbbb")
+        );
+        assert_eq!(crypttab_uuid_of(CRYPTTAB, "nvme9n1p3_crypt"), None);
+    }
+
+    #[test]
+    fn missing_crypttab_names_flags_members_the_initrd_cannot_unlock() {
+        let names = ["nvme2n1p3_crypt".to_string(), "nvme4n1p3_crypt".to_string()];
+        assert_eq!(
+            missing_crypttab_names(CRYPTTAB, &names),
+            vec!["nvme4n1p3_crypt"]
+        );
     }
 }

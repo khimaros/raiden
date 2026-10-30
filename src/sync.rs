@@ -321,6 +321,29 @@ pub fn initrd_listing(initrd: &str) -> std::result::Result<String, String> {
     }
 }
 
+/// the crypttab baked into an initrd by cryptsetup-initramfs (the members it will
+/// unlock at boot), or Err with the reason. unpacks the initrd to a scratch dir:
+/// lsinitramfs lists names only, and the entries are what matter.
+pub fn initrd_crypttab(initrd: &str) -> std::result::Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("raiden-initrd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let unpacked = Command::new("unmkinitramfs")
+        .arg(initrd)
+        .arg(&dir)
+        .output()
+        .map_err(|_| format!("unmkinitramfs unavailable; cannot read {initrd}"))?;
+    // with early microcode the main archive lands under main/.
+    let text = ["cryptroot/crypttab", "main/cryptroot/crypttab"]
+        .iter()
+        .find_map(|rel| std::fs::read_to_string(dir.join(rel)).ok());
+    let _ = std::fs::remove_dir_all(&dir);
+    match text {
+        Some(t) => Ok(t),
+        None if !unpacked.status.success() => Err(format!("unmkinitramfs failed on {initrd}")),
+        None => Err(format!("{initrd} carries no cryptroot/crypttab")),
+    }
+}
+
 /// whether an initrd contains cryptsetup, so an encrypted root can unlock from the
 /// initramfs. Ok, or Err with the reason. used by sync's source verification.
 pub fn initrd_has_cryptsetup(initrd: &str) -> std::result::Result<(), String> {

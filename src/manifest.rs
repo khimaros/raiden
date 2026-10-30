@@ -2,8 +2,9 @@
 // the full resolved config so post-install operations (status, scrub, rescue,
 // replace, close) resolve from it rather than a hand-maintained config. the
 // install pipeline writes it into the target; ops on the running system update
-// it via save(). devices are resolved from the config at run time (blkid,
-// fstab), so no per-disk identifiers are stored here.
+// it via save(). each member's stable /dev/disk/by-id link is recorded in
+// config.disks.ids; partition and fs uuids are resolved at run time (blkid,
+// fstab), so they are not stored here.
 //
 // /boot/raiden/manifest.toml is the canonical copy: it is reachable from a
 // livecd by mounting a member's /boot alone, without unlocking the root fs.
@@ -26,9 +27,10 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn from_config(cfg: &Config) -> Self {
-        Manifest {
-            config: cfg.clone(),
-        }
+        let mut config = cfg.clone();
+        // a disk swapped out by replace keeps its id only for the plan's duration.
+        config.disks.ids = config.disks.member_ids();
+        Manifest { config }
     }
 
     /// serialize the manifest to toml (used both to save() and to emit the

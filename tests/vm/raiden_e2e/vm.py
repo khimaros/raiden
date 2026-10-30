@@ -180,10 +180,12 @@ class VM:
 
     # -- lifecycle ------------------------------------------------------------
 
-    def start(self, cdrom_first: bool = False) -> None:
+    def start(self, cdrom_first: bool = False, disks: list[tuple[str, str]] | None = None) -> None:
+        """disks overrides the (slot, image) pairing, eg. to move images between
+        slots so the guest kernel names them differently."""
         xml = domain.build_xml(
             self.cfg,
-            disks=self.disks,
+            disks=disks or self.disks,
             nvram_path=self.nvram,
             payload_dir=str(self.payload),
             cdrom_first=cdrom_first,

@@ -48,6 +48,35 @@ def test_scenario_selection():
     assert [s.__name__ for s in picked] == ["truncate_disks", "corrupt_efiboot"]
 
 
+def test_disk_serial_follows_the_image_not_the_slot():
+    # member_rename moves images between slots; the by-id link must move with them.
+    from raiden_e2e.config import VMConfig
+    from raiden_e2e.domain import build_xml
+
+    xml = build_xml(
+        VMConfig(stack="dm-crypt~md~lvm~ext4", iso="/x.iso"),
+        disks=[("vda", "/img/vdb.raw"), ("vdb", "/img/vda.raw")],
+        nvram_path="/n.fd",
+        payload_dir="/p",
+    )
+    assert xml.index('dev="vda"') < xml.index("raiden-vdb") < xml.index('dev="vdb"')
+    assert xml.index('dev="vdb"') < xml.index("raiden-vda")
+
+
+def test_doctor_status_reads_the_table_row():
+    from raiden_e2e.scenarios import _doctor_status
+
+    out = (
+        "                 status  detail\r\n"
+        "member ids       ok      vda -> /dev/disk/by-id/virtio-raiden-vda\r\n"
+        "crypttab         warn    vda3_crypt: crypttab x != disk y\r\n"
+        "  crypttab ok continuation\r\n"
+    )
+    assert _doctor_status(out, "member ids") == "ok"
+    assert _doctor_status(out, "crypttab") == "warn"
+    assert _doctor_status(out, "disk presence") == "absent"
+
+
 def test_benchmark_off_by_default():
     # the default bundle is resilience-only: the sysbench benchmark is opt-in, so a
     # plain run skips the costly pass but still exercises the resilience scenarios
