@@ -32,6 +32,9 @@ const FAIL: &str = "fail";
 const FIXED: &str = "fixed";
 
 const CRYPTTAB_PATH: &str = "/etc/crypttab";
+const SYS_BLOCK: &str = "/sys/class/block";
+const LUKS_DM_UUID_PREFIX: &str = "CRYPT-LUKS";
+const INTEGRITY_SUFFIX: &str = "_dif";
 
 /// which mirror set a uuid re-stamp targets.
 #[derive(Clone, Copy)]
@@ -270,10 +273,14 @@ fn fix_commands(fix: &Fix, layout: &Layout) -> Vec<String> {
         Fix::Debconf => debconf_commands(),
         Fix::Fstab => vec!["append the missing /boot or /boot/efi UUID= entry to /etc/fstab".into()],
         Fix::Crypttab => {
-            let mut c = vec![
-                format!("write {CRYPTTAB_PATH}: one entry per member, by its luks uuid"),
-                "dmsetup rename <open name> <member name>   # per misnamed open mapping".into(),
-            ];
+            let mut c = vec![format!(
+                "write {CRYPTTAB_PATH}: one entry per member, by its luks uuid"
+            )];
+            c.extend(
+                open_renames(layout)
+                    .iter()
+                    .map(|(old, new)| format!("dmsetup rename {old} {new}")),
+            );
             c.extend(refresh_commands(layout));
             c
         }
@@ -551,28 +558,78 @@ fn member_ids_fix(
 /// system agrees with the rewritten crypttab (dmsetup renames a live device in
 /// place). returns how many were renamed.
 fn rename_open_mappings(layout: &Layout) -> Result<usize> {
-    let mut n = 0;
-    for d in &layout.members {
-        let want = layout.crypt_name(d);
-        let Some(open) = open_mapping_of(&layout.part(d, 3)) else {
-            continue;
-        };
-        if open != want {
-            run_ok(&["dmsetup".into(), "rename".into(), open, want])?;
-            n += 1;
-        }
+    let renames = open_renames(layout);
+    for (old, new) in &renames {
+        run_ok(&["dmsetup".into(), "rename".into(), old.clone(), new.clone()])?;
     }
-    Ok(n)
+    Ok(renames.len())
 }
 
-/// the dm name of the mapping stacked directly on a partition, from sysfs holders.
-fn open_mapping_of(part: &str) -> Option<String> {
-    let k = disk_id::kernel_name_of(part)?;
-    fs::read_dir(format!("/sys/class/block/{k}/holders"))
-        .ok()?
+/// the (open name, wanted name) dm renames that bring every member in line with
+/// the layout.
+fn open_renames(layout: &Layout) -> Vec<(String, String)> {
+    layout
+        .members
+        .iter()
+        .filter_map(|d| {
+            let part = disk_id::kernel_name_of(&layout.part(d, 3))?;
+            Some(member_renames(
+                Path::new(SYS_BLOCK),
+                &part,
+                &layout.crypt_name(d),
+            ))
+        })
         .flatten()
-        .find_map(|h| fs::read_to_string(h.path().join("dm/name")).ok())
-        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// the dm renames for one member's root partition: its crypt device and, when
+/// luks2 built-in integrity stacks one under it, the matching <name>_dif device,
+/// so the pair keeps the naming cryptsetup itself gives them at open.
+fn member_renames(sys: &Path, part: &str, want: &str) -> Vec<(String, String)> {
+    let chain = crypt_chain(sys, part);
+    let Some((open, below)) = chain.split_last() else {
+        return Vec::new();
+    };
+    if open == want {
+        return Vec::new();
+    }
+    let open_dif = format!("{open}{INTEGRITY_SUFFIX}");
+    let mut renames = vec![(open.clone(), want.to_string())];
+    if below.contains(&open_dif) {
+        renames.push((open_dif, format!("{want}{INTEGRITY_SUFFIX}")));
+    }
+    renames
+}
+
+/// the dm names stacked on a block device, bottom up, ending at its dm-crypt
+/// device; empty when none is open. the luks uuid prefix is what identifies the
+/// crypt layer: the integrity layer below it is CRYPT-SUBDEV-.
+fn crypt_chain(sys: &Path, kernel: &str) -> Vec<String> {
+    let dm_attr = |dev: &str, attr: &str| {
+        fs::read_to_string(sys.join(dev).join("dm").join(attr))
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    let Ok(holders) = fs::read_dir(sys.join(kernel).join("holders")) else {
+        return Vec::new();
+    };
+    for holder in holders.flatten() {
+        let dev = holder.file_name().to_string_lossy().into_owned();
+        let Some(name) = dm_attr(&dev, "name") else {
+            continue;
+        };
+        let is_crypt = dm_attr(&dev, "uuid").is_some_and(|u| u.starts_with(LUKS_DM_UUID_PREFIX));
+        let above = if is_crypt {
+            Vec::new()
+        } else {
+            crypt_chain(sys, &dev)
+        };
+        if is_crypt || !above.is_empty() {
+            return std::iter::once(name).chain(above).collect();
+        }
+    }
+    Vec::new()
 }
 
 /// rebuild every initrd, push /boot to the independent mirrors, then confirm each
@@ -1830,6 +1887,96 @@ fn first_glob(dir: &str, prefix: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// a fake /sys/class/block: `stack` lists a partition's holders bottom up, as
+    /// (dm name, dm uuid). a device's dm/ dir holds name + uuid; its holders/ dir
+    /// links each holder by kernel name.
+    fn fake_sys(test: &str, part: &str, stack: &[(&str, &str)]) -> std::path::PathBuf {
+        let sys = std::env::temp_dir().join(format!("raiden-sys-{test}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sys);
+        let mut below = part.to_string();
+        fs::create_dir_all(sys.join(part).join("holders")).unwrap();
+        for (i, (name, uuid)) in stack.iter().enumerate() {
+            let kernel = format!("dm-{i}");
+            fs::create_dir_all(sys.join(&kernel).join("dm")).unwrap();
+            fs::create_dir_all(sys.join(&kernel).join("holders")).unwrap();
+            fs::write(sys.join(&kernel).join("dm/name"), format!("{name}\n")).unwrap();
+            fs::write(sys.join(&kernel).join("dm/uuid"), format!("{uuid}\n")).unwrap();
+            symlink(
+                format!("../../{kernel}"),
+                sys.join(&below).join("holders").join(&kernel),
+            )
+            .unwrap();
+            below = kernel;
+        }
+        sys
+    }
+
+    const DIF_UUID: &str = "CRYPT-SUBDEV-44e87242c7034ff68e2c993529782a72-nvme0n1p3_crypt_dif";
+    const CRYPT_UUID: &str = "CRYPT-LUKS2-44e87242c7034ff68e2c993529782a72-nvme0n1p3_crypt";
+
+    fn renames(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn aead_rename_moves_the_crypt_layer_and_its_integrity_layer() {
+        let sys = fake_sys(
+            "aead",
+            "nvme0n1p3",
+            &[
+                ("nvme0n1p3_crypt_dif", DIF_UUID),
+                ("nvme0n1p3_crypt", CRYPT_UUID),
+            ],
+        );
+        assert_eq!(
+            member_renames(&sys, "nvme0n1p3", "raiden0_crypt"),
+            renames(&[
+                ("nvme0n1p3_crypt", "raiden0_crypt"),
+                ("nvme0n1p3_crypt_dif", "raiden0_crypt_dif"),
+            ])
+        );
+    }
+
+    #[test]
+    fn aead_mapping_already_named_is_left_alone() {
+        // the first holder is X_dif, which must not read as a misnamed X.
+        let sys = fake_sys(
+            "named",
+            "nvme0n1p3",
+            &[
+                ("nvme0n1p3_crypt_dif", DIF_UUID),
+                ("nvme0n1p3_crypt", CRYPT_UUID),
+            ],
+        );
+        assert_eq!(
+            member_renames(&sys, "nvme0n1p3", "nvme0n1p3_crypt"),
+            renames(&[])
+        );
+    }
+
+    #[test]
+    fn plain_crypt_rename_moves_the_single_layer() {
+        let sys = fake_sys("plain", "vda3", &[("vda3_crypt", CRYPT_UUID)]);
+        assert_eq!(
+            member_renames(&sys, "vda3", "raiden0_crypt"),
+            renames(&[("vda3_crypt", "raiden0_crypt")])
+        );
+    }
+
+    #[test]
+    fn a_holder_stack_without_a_crypt_device_is_not_renamed() {
+        let sys = fake_sys(
+            "nocrypt",
+            "vda3",
+            &[("vda3_int", "CRYPT-INTEGRITY-vda3_int")],
+        );
+        assert_eq!(member_renames(&sys, "vda3", "raiden0_crypt"), renames(&[]));
+    }
 
     #[test]
     fn ok_passes_warn_and_fail_do_not() {

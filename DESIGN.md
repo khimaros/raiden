@@ -66,7 +66,10 @@ by default, so crypttab is unaffected by renames; `disks.crypt_names = "index"`
 names them by slot (`raiden0_crypt`) instead, and a `replace --with` disk inherits
 its slot's name (`Layout::with_retired` lets the outgoing label resolve the same
 slot). dm-integrity devices are the exception: the boot-time udev rule names them
-`%k_int`, so `int_name` follows the current node. `--disks` arguments go through
+`%k_int`, so `int_name` follows the current node. when doctor renames a live
+mapping it walks the partition's sysfs holders to the device with a `CRYPT-LUKS`
+dm uuid: on aead stacks the partition's own holder is cryptsetup's `<name>_dif`
+(`CRYPT-SUBDEV-`), which is renamed along with it. `--disks` arguments go through
 `Layout::member_for`, which accepts a label, a current node, or an id path, and
 refuses a label that is now another member's node (either reading could be the
 wrong physical disk).

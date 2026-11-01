@@ -23,6 +23,7 @@ WORKDIR = "/srv/raiden"
 RAIDEN = f"{WORKDIR}/raiden"
 PWFILE = f"{WORKDIR}/password"
 GUEST = f"{WORKDIR}/guest"
+MANIFESTS = ("/boot/raiden/manifest.toml", "/etc/raiden/manifest.toml")
 
 DETECT_KEYWORDS = (
     "error", "corrupt", "cksum", "mismatch", "read error", "faulty", "degraded",
@@ -506,6 +507,37 @@ def member_rename(s: Session) -> None:
     s.report.add(scen, "restored", PASS if rc == 0 else FAIL, _tail(out))
 
 
+def crypt_names_switch(s: Session) -> None:
+    """opt an installed system into index crypt names and back, the path documented
+    in the readme: edit both manifests, `doctor --fix`, cold boot. on an aead stack
+    each member is <name>_dif under <name>, so the rename has to find the crypt
+    layer rather than the partition's first holder."""
+    scen = "crypt names"
+    first = s.members()[0]
+
+    def switch(names: str, want: str) -> None:
+        s.c.run(
+            rf"sed -i 's/^crypt_names = .*/crypt_names = \"{names}\"/' {' '.join(MANIFESTS)}",
+            check=True,
+        )
+        _, out = s.raiden("doctor --fix --dry-run")
+        shown = re.search(rf"dmsetup rename \S+_dif {want}_dif", out) is not None
+        s.report.add(scen, f"{names} preview", PASS if shown else FAIL, _tail(out))
+        s.raiden("doctor --fix --yes", timeout=900)
+        rc, out = s.c.run(f"cryptsetup status {want} && dmsetup info -c -o name,uuid", timeout=30)
+        crypt = rc == 0 and "is active" in out and f"{want}_dif" in out
+        s.report.add(scen, f"{names} rename", PASS if crypt else FAIL, _tail(out))
+        s.restart()
+        rc, out = s.raiden("doctor")
+        ok = rc == 0 and _doctor_status(out, "crypttab") == "ok"
+        s.report.add(scen, f"{names} boot", PASS if ok else FAIL, _tail(out))
+        rc, out = s.c.run(f"test -b /dev/mapper/{want} && test -b /dev/mapper/{want}_dif", timeout=30)
+        s.report.add(scen, f"{names} after boot", PASS if rc == 0 else FAIL, want)
+
+    switch("index", "raiden0_crypt")
+    switch("kernel", f"{first}3_crypt")
+
+
 # every in-place scenario, in run order. selectable individually with --scenario.
 INPLACE = [
     sysbench,
@@ -518,6 +550,7 @@ INPLACE = [
     sync_mirrors,
     doctor_fix,
     member_rename,
+    crypt_names_switch,
 ]
 
 # the default bundled run is resilience-only: the sysbench benchmark is opt-in
@@ -535,6 +568,7 @@ DEFAULT_INPLACE = [
     sync_mirrors,
     doctor_fix,
     member_rename,
+    crypt_names_switch,
 ]
 
 # the livecd rescue flow (corrupt 4/4 + recover) is selectable by this name too.
